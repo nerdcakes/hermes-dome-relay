@@ -27,7 +27,9 @@ A [Hermes Agent](https://github.com/NousResearch) plugin from **Team Astrum** th
 
 ## Security
 
-Never commit URLs, keys or tokens. Put them in environment variables (`DOME_RELAY_URL`, `DOME_RELAY_KEY`) and keep them out of the repo.
+Never commit URLs, keys or tokens. Secrets are read only through `agent.secret_scope.get_secret(...)` (Hermes catalog rule 11). Set `relay_url` in plugin config under `plugins.entries.dome-relay.settings`. Never read secrets from `.env`, `auth.json`, or `os.environ`.
+
+The design draft is in [SPEC.md](SPEC.md). Nothing here runs yet.
 
 ## License
 
