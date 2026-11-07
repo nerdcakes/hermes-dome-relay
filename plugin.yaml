@@ -12,26 +12,21 @@ provides_tools: []
 provides_hooks: []
 capabilities: []
 config_schema:
+  # The Grok routine URL and key are Fly secrets on the relay process only
+  # (DOME_RELAY_GROK_WEBHOOK_URL and DOME_RELAY_GROK_KEY). This plugin must
+  # not declare them, read them, or wake Grok.
   relay_url:
     type: str
     default: ""
     description: Approved HTTPS callback relay origin; no credentials in URLs.
-  grok_webhook_url:
-    type: str
-    default: ""
-    description: Approved routine POST URL; never include sender key here.
   callback_host:
     type: str
     default: ""
     description: Exact allowlisted relay hostname.
-  grok_key:
-    type: secret
-    env: DOME_RELAY_GROK_KEY
-    description: Grok Bot routine sender key; read with get_secret.
   relay_key:
     type: secret
     env: DOME_RELAY_KEY
-    description: Plugin registration and result-consumer key, not executive callback key.
+    description: Plugin registration and result-consumer key. Not the executive callback key and not the Grok wake key.
   max_attempts:
     type: int
     default: 3

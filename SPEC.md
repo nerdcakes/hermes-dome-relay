@@ -1,11 +1,11 @@
 # Dome Relay technical specification
 
-**Status:** design draft, not implemented or validated. Author: Juni, interim CTO.
+**Status:** the relay in `relay/` is implemented and is the contract below. The Hermes plugin and local worker are still a design and are not implemented. Author: Juni, interim CTO. Relay rules below were aligned to the built service.
 **Target:** one real round trip before the November 11, 2026 noon HST contest deadline.
 
 ## 1. Goal and scope
 
-Keep established assistants in their own workspaces. A local Hermes agent asks Celeste to escalate a job; a webhook wakes the selected Grok Bot executive; the executive uses its existing tools; an authenticated callback returns its result to the original conversation.
+Keep established assistants in their own workspaces. A local Hermes agent asks Celeste to escalate a job; the relay (not the plugin) wakes the selected Grok Bot executive; the executive uses its existing tools; an authenticated callback returns its result to the original conversation.
 
 The MVP must also reject duplicates, hold local-only work while the worker is offline, and recover jobs and received results after process restart. Non-goals: Lyra's host adapter, email and Telegram (after the contest), arbitrary remote code execution, a new agent runtime, and moving identities into Hermes.
 
@@ -13,7 +13,7 @@ A real external executive and sanctioned callback mechanism must be proven. A mo
 
 ## 2. Current repository and exact Hermes integration contract
 
-Read before this draft: README.md, plugin.yaml, dome_relay/__init__.py and .gitignore on main. Current code only builds a partial brief; send_brief raises NotImplementedError. The root manifest explicitly says its format is a placeholder. No runnable plugin is claimed.
+Read before changing the plugin: README.md, plugin.yaml, dome_relay/__init__.py, .gitignore, and `relay/` on main. The relay service runs. The plugin still only builds a partial brief; send_brief raises NotImplementedError. No runnable plugin is claimed. The manifest must not declare the Grok webhook URL or the Grok key.
 
 ### Layout and entrypoint
 
@@ -30,7 +30,7 @@ dome_relay/
   storage.py
   worker.py
   adapters/base.py
-  adapters/grok_webhook.py
+  adapters/relay_client.py      # registers with the relay; never calls Grok
 relay/
   app.py
   storage.py
@@ -52,7 +52,7 @@ In root `register(ctx)`, register exactly `dome_relay_escalate`, `dome_relay_sta
 
 Manifest v2 uses top-level `provides_tools`, `provides_hooks`, `config_schema`, `requires_env`, `python_dependencies` and a LIST of privileged `capabilities`. Do not confuse this with a future catalog YAML's `capabilities` MAPPING, which summarizes actual tools/hooks/middleware/env names. Declare only implemented registrations. A design commit should retain `provides_tools: []` until tools actually register.
 
-Use `ctx.get_config("relay_url", default="")` for nonsecret plugin settings, resolved under `plugins.entries.dome-relay.settings`; `ctx.set_config` changes only that namespace. Read declared secrets through `from agent.secret_scope import get_secret`, then `get_secret("DOME_RELAY_GROK_KEY")` (and the other declared names). Never read `.env`, auth.json, browser profiles or a bare process-wide environment for Hermes secrets. Resolve the active profile's values before passing narrowly scoped credentials to a worker; do not reuse one global client across profiles.
+Use `ctx.get_config("relay_url", default="")` for nonsecret plugin settings, resolved under `plugins.entries.dome-relay.settings`; `ctx.set_config` changes only that namespace. The only plugin secret is `DOME_RELAY_KEY`, read through `from agent.secret_scope import get_secret`, then `get_secret("DOME_RELAY_KEY")`. The plugin must never read `DOME_RELAY_GROK_KEY`, `DOME_RELAY_GROK_WEBHOOK_URL`, or `DOME_RELAY_CALLBACK_KEY`. Those live only as Fly secrets on the relay process. Never read `.env`, auth.json, browser profiles or a bare process-wide environment for Hermes secrets. Resolve the active profile's values before passing narrowly scoped credentials to a worker; do not reuse one global client across profiles.
 
 Use `plugins.plugin_storage.plugin_db("dome-relay")` for profile-scoped durable SQLite storage and `plugin_data_dir` where files are necessary. Never put runtime databases in the plugin install tree. The worker is an explicitly started plugin-owned process/CLI command, with clean shutdown, bounded network timeouts and a single-worker lease. Keep root registration cheap. Final implementation must use public lifecycle APIs and must declare any added hooks/commands honestly.
 
@@ -68,24 +68,38 @@ The worker runs network I/O without model-token polling. A configured interval c
 
 The MVP returns results through status retrieval in the origin conversation until reinjection is proven on the pinned Hermes build. `ctx.inject_message` is UNVERIFIED in the Hermes plugin guide; do not build against it as an established API. The documented surface is `pre_llm_call` hook injection, which is ephemeral and applies to the current turn only, not persisted delivery to the origin session. Any future automatic reinjection must first prove correct active-profile context and session recovery on the pinned build; if the origin session no longer exists, retain the result for status retrieval instead of injecting into a random new session. Any proven automatic delivery remains at-least-once with a stable result ID, not guaranteed exactly once across a crash at the host boundary.
 
-### B. Generic target adapter
+### B. Plugin dispatch
 
 Interface (conceptual, not Hermes API): `validate_config`, `dispatch(envelope) -> accepted | rejected | uncertain`, and optional `reconcile(job_id)`. Do not assume all targets support cancel or idempotent execution.
 
-GrokWebhookAdapter POSTs the envelope JSON to a configured HTTPS routine URL with `Authorization: Bearer <get_secret("DOME_RELAY_GROK_KEY")>`, timeouts and redirects disabled. A 200 acknowledges that a routine run started; it is NOT a result. A transport timeout after sending is uncertain, not proof the job failed. Never blindly re-wake an uncertain/accepted job.
+The plugin dispatches by registering the job with the relay (`POST /jobs` on `relay_url`, `Authorization: Bearer <get_secret("DOME_RELAY_KEY")>`). Registration is the plugin's only network call for a new job. The relay performs the Grok wake. The plugin must never POST to the Grok routine, must never hold `DOME_RELAY_GROK_KEY` or `DOME_RELAY_GROK_WEBHOOK_URL`, and must never retry by calling Grok itself. A 201 from the relay means the job was stored and the relay attempted the wake. A 200 means the same job was already registered. Read `wake_status` on that response: `accepted` means the routine run started, and it is not a result. `rejected` means Grok did not start a run. `uncertain` means the relay cannot tell whether the request arrived. The plugin must not send its own wake in any of those cases. A transport timeout after the registration request was sent is uncertain. Repeating the same registration is safe: the relay will not wake again after an accepted, rejected, or uncertain wake. It will send once only if the first process died before the webhook call (`wake_status` still `pending`).
 
 ### C. Always-on callback relay
 
-FastAPI or equivalent. Free-tier deployment is an option, not a guarantee: verify persistence, quotas, sleep behavior, TLS and costs. SQLite requires a durable single-instance volume; an ephemeral filesystem cannot satisfy restart recovery. If the host cannot provide that, use its durable database service.
+Implemented in `relay/` (FastAPI). Host recipe: one Fly machine, `auto_stop_machines = "off"` and `min_machines_running = 1`, SQLite on a Fly volume mounted at `/data`. An ephemeral disk cannot satisfy restart recovery. Two machines must not share the file. Free-tier deployment is an option, not a guarantee: verify persistence, quotas, sleep behavior, TLS and costs.
 
-Additional registration endpoint is necessary to authenticate results for known jobs:
+The relay, not the plugin, sends the Grok wake. On the first successful registration it POSTs the envelope JSON to `DOME_RELAY_GROK_WEBHOOK_URL` with `Authorization: Bearer <DOME_RELAY_GROK_KEY>`, a bounded timeout, redirects disabled, and environment proxy variables ignored. HTTP 200 from Grok means a run started. It does not mean the work finished. Any other HTTP response means a run did not start. A read or write timeout after the request may have been sent is `uncertain`, and that job is not woken again. Fixed claim and complete URLs are preconfigured in the routine, not obeyed from incoming task text. No credential is embedded in `callback_url`.
 
-- `POST /jobs`: plugin registers immutable job_id, target, deadline and envelope hash before wake-up. Authenticated with an owner/plugin key. Same ID + same body returns existing registration; different body returns 409.
-- `POST /complete`: executive sends Result JSON, authenticated with a separately provisioned per-target callback bearer key. Check job exists, target owns it, deadline/state permits completion, body size and schema. Secrets are headers, never JSON or URL parameters. Identical duplicate completion returns 409 duplicate_result and cannot add another result; conflicting completion returns 409 conflict. First terminal result wins.
-- `GET /results?since=<opaque-cursor>&limit=100`: authenticated plugin consumer, scoped to its owner/profile. Returns ordered entries, each with a sequence cursor and Result, plus next_cursor. Non-destructive: fetching never deletes data or globally advances a cursor. The plugin commits its own cursor only after saving the batch.
-- `POST /jobs/{job_id}/claim`: authenticated executive routine atomically claims before doing any work. Return claimed only once; duplicate or canceled/expired jobs are rejected. This closes the duplicate-wake gap. A crashed executive's claim is NOT automatically re-executed; operator reconciliation is required for uncertain side effects.
+The relay process reads these from Fly secrets. `DOME_RELAY_GROK_KEY` and `DOME_RELAY_GROK_WEBHOOK_URL` exist only there. The plugin's only secret is `DOME_RELAY_KEY`. The executive holds `DOME_RELAY_CALLBACK_KEY` and does not hold the Grok key:
 
-The relay does not need the Grok Bot sender key. The plugin owns outbound wake authentication; the executive host securely owns its callback/claim key. Fixed endpoints are preconfigured in the routine, not obeyed from incoming task text. No credential is embedded in callback_url.
+- `DOME_RELAY_KEY` — plugin. Register, cancel, and read results. Cannot claim or complete.
+- `DOME_RELAY_CALLBACK_KEY` — executive. Claim and complete. Cannot register or list results.
+- `DOME_RELAY_GROK_KEY` — wake bearer. Sent only to the configured webhook.
+- `DOME_RELAY_GROK_WEBHOOK_URL` — routine POST URL. HTTPS and a public host. Not a plugin setting.
+- `DOME_RELAY_PUBLIC_ORIGIN` — this relay's public origin, with no path and no key.
+
+`DOME_RELAY_KEY`, `DOME_RELAY_CALLBACK_KEY`, and `DOME_RELAY_GROK_KEY` must be three different values. Compare bearer keys in constant time. Secrets are headers, never JSON or URL parameters.
+
+Endpoints:
+
+- `POST /jobs`: plugin registers the envelope, `envelope_hash`, and `hop` (`0` or `1`). Authenticated with `DOME_RELAY_KEY`. The relay persists the job before the wake. Same `job_id` + same identity hash + same hop returns the existing registration and does not wake again, except the single pending-before-send recovery above. Same `job_id` with a different hash or hop returns 409. `hop` greater than 1, or any `parent_job_id`, returns 409 `hop_limit` and does not wake.
+- `POST /jobs/{job_id}/claim`: executive claims before doing any work. Authenticated with `DOME_RELAY_CALLBACK_KEY`. No body. Return claimed only once. A duplicate claim, a canceled job, and an expired job are rejected. One accepted or held job per target; a busy slot is rejected. A crashed executive's claim is not automatically re-executed. The claim stands until `POST /jobs/{job_id}/cancel` or until the 30 minute expiry. Do not auto-reclaim.
+- `POST /jobs/{job_id}/complete`: executive sends Result JSON. Authenticated with `DOME_RELAY_CALLBACK_KEY`. The body's `job_id` must match the path. There is no `POST /complete`. Check the job exists, it was claimed, and the deadline and state still allow completion. Identical duplicate completion returns 409 `duplicate_result` and cannot add another result. A different result after a terminal one returns 409 `conflict`. The first terminal result wins. `held` may be updated with a distinct body and later superseded by `done` or `failed`. A late (expired) callback is quarantined and does not resurrect the job. This endpoint never wakes Grok and cannot start another job.
+- `POST /jobs/{job_id}/cancel`: plugin key. Stops a later claim or result and releases the target slot. Cancellation after a wake is local and best-effort. It cannot undo external work or stop a running Grok Bot routine. `done` and `failed` stay as they are.
+- `GET /results?since=<opaque-cursor>&limit=100`: plugin key. `since` is a cursor this relay returned (`c` plus a decimal integer); omit it to read from the start. `limit` is 1 to 100 and defaults to 100. Returns ordered entries, each with a cursor and a Result, plus `next_cursor`. Non-destructive: fetching never deletes data or stores a consumer cursor. The plugin commits its own cursor only after saving the batch. One deployed relay key is one owner. Hermes profile isolation stays in the plugin database.
+- `GET /healthz`: no key. Fly uses it. The handler also marks overdue jobs expired so a dead claim does not hold the slot forever.
+
+`callback_url` must equal `{DOME_RELAY_PUBLIC_ORIGIN}/jobs/{job_id}/complete` exactly.
 
 ## 4. JSON contracts
 
@@ -114,7 +128,7 @@ These are JSON Schema draft 2020-12 contracts. All timestamps are RFC3339 UTC on
 }
 ```
 
-Immutable identity hash excludes attempt. Artifacts are references, never automatically uploaded files or secrets; reject signed/token-bearing URLs and do not auto-fetch arbitrary links. The relay matches callback_url to its exact configured HTTPS origin and /complete path. `from` is an audit label; verified sender identity comes from authentication, not the JSON string.
+Identity hash: lowercase hex SHA-256 of the canonical JSON of the envelope with `attempt` removed. Canonical JSON sorts object keys, uses separators `,` and `:` with no extra spaces, and is UTF-8 with non-ASCII left as characters (Python `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`). Before hashing, the relay normalizes each timestamp to UTC `YYYY-MM-DDTHH:MM:SSZ` and requires `job_id` to be a lowercase UUID. `hop` is not inside the hash; it is compared on its own. Same `job_id` with the same hash and the same hop is the same registration even when `attempt` changes. Same `job_id` with a different hash or hop is a conflict. Artifacts are references, never automatically uploaded files or secrets; reject any query string or credential on those URLs and do not auto-fetch them. `callback_url` must equal `{DOME_RELAY_PUBLIC_ORIGIN}/jobs/{job_id}/complete`. `from` is an audit label; verified sender identity comes from authentication, not the JSON string.
 
 ### Result
 
@@ -140,14 +154,15 @@ Immutable identity hash excludes attempt. Artifacts are references, never automa
 States: queued -> registered -> dispatching -> accepted -> done/failed. Side states: held_local, retry_wait, uncertain, canceled, expired. Keep delivery_pending/delivered separate from execution state.
 
 - Insert job_id under a UNIQUE constraint before side effects. Repeating identical escalate returns the existing handle; ID reuse with changed content is an error.
-- Retry safe registration/pull/complete requests up to three total attempts with delays 5 and 15 seconds plus jitter; honor Retry-After within the deadline. Retry only eligible transient failures. Never retry 401/403 until configuration is fixed.
-- A webhook retry may create a second routine run. The mandatory claim step must deny duplicate work. After an accepted or ambiguous wake, reconcile claim/results; do not blindly dispatch again. Never report exactly-once arbitrary external effects.
-- Default concurrency one outstanding accepted job per target. Reserve the slot transactionally; release on terminal result, explicit operator resolution or deadline. Held jobs retain their slot.
-- Default maximum one external escalation hop: return results cannot themselves dispatch. Store parent lineage and hop count locally. An executive cannot create a forwarding chain through /complete.
+- The relay retries the Grok wake up to three total attempts. After a transient failure, wait 5 seconds, then 15 seconds, plus a random extra of up to 1 second. A `Retry-After` header replaces that base wait and is still not honored if the wait would pass the job deadline. Retry connect failures and HTTP 408, 429, 500, 502, 503, and 504 only. Never retry 401 or 403. Do not follow redirects. A read or write timeout is uncertain and is not retried. The plugin may retry its own registration and result pull against the relay with the same 3-attempt schedule, and must never turn that retry into a second wake.
+- A repeated registration must not create a second routine run. The claim step denies duplicate work. After an accepted, rejected, or uncertain wake, do not wake again. Never report exactly-once arbitrary external effects.
+- One outstanding accepted job per target. Reserve the slot transactionally on claim. Release it on a terminal result (`done` or `failed`), on cancel, or when the deadline expires. Held jobs retain the slot.
+- One external escalation hop. A registration may use `hop` 0 or 1 and must not include `parent_job_id`. A higher hop or any parent is rejected and is not woken. `POST /jobs/{job_id}/complete` cannot dispatch another job.
 - Local-only jobs require an explicit local readiness heartbeat/lease. Missing or stale heartbeat means held_local, not repeated wake-ups. If the entire rig is off, existing callbacks remain on the cloud relay; new local queue work resumes when the machine returns.
-- Expire before each send and claim. Use server receive time to validate result timeliness; never trust a sender-supplied completed_at to bypass expiry.
-- Reconcile interrupted leases after restart. Fetch non-destructively from the last committed cursor; transactionally dedupe result records. Recover an in-flight wake as uncertain rather than treating it as unsent.
-- Append audit metadata for transitions, attempts, accepted/uncertain wake, claims, duplicate rejection, auth failure counts and delivery. Do not put brief/result bodies, credentials or full webhook URLs in logs.
+- Expiry is 30 minutes from server receive time. A client `deadline` may only shorten that window: it must be after `created_at`, in the future on the relay clock, and no later than 30 minutes after receipt. Register, claim, and complete all enforce it. `completed_at` is stored as a label and cannot extend the life of the job. A completion that arrives after expiry is quarantined and does not resurrect the job.
+- Reconcile interrupted leases after restart. Fetch non-destructively from the last committed cursor; transactionally dedupe result records. Recover an in-flight wake (`dispatching` when the process died) as `uncertain` rather than treating it as unsent, and do not send it again. A row still `registered` with `wake_status` `pending` has not been sent; the next identical registration may send it once.
+- A claim that outlives the executive is not reclaimed. It remains `accepted` until cancel or the 30 minute expiry. Do not start a second claim for that job automatically.
+- Append audit metadata for transitions, attempts, accepted/uncertain/rejected wake, claims, duplicate rejection, auth failure counts and delivery. Do not put brief or result bodies, credentials, or full webhook URLs in logs or in the audit table. After a wake attempt finishes, delete the stored task text from the relay database. Results stay in SQLite on the volume until an operator deletes that database file. There is no purge tool in this version.
 
 The demonstration can show one accepted claim and one terminal record under tested failures. Transport and host notification remain at-least-once; exactly-once execution of arbitrary assistant actions is out of scope.
 
@@ -179,20 +194,25 @@ Live demo: enqueue a harmless research job; executive webhook wakes; routine cla
 | Agent B: callback relay | relay/*, tests/relay/* | Durable registration/claim/completion/result API, authentication, hosting recipe |
 | Agent C: contracts/integration/docs | schemas/*, scripts/e2e.py, tests/integration/*, README.md, deployment notes, .gitignore | Contract fixtures, acceptance evidence, safe demo/runbook |
 
-Juni owns SPEC.md/interface decisions; Rhea coordinates branches, reviews integration and safety. With two agents, B also owns relay tests and A local tests; Rhea/Juni handle cross-system integration. Only one owner edits any shared file. Freeze contracts before parallel work; changes require coordinator review. This table does not authorize a launch, merge, deployment or contest submission by itself.
+The relay in section 3C is already implemented. The plugin must follow that contract and must not add its own Grok wake. Juni owns SPEC.md/interface decisions; Rhea coordinates branches, reviews integration and safety. With two agents, B also owns relay tests and A local tests; Rhea/Juni handle cross-system integration. Only one owner edits any shared file. Freeze contracts before parallel work; changes require coordinator review. This table does not authorize a launch, merge, deployment or contest submission by itself.
 
 ## 9. Open questions / gates
 
 1. Which released Hermes version is the test baseline, and what is the minimum supported SemVer after validation?
-2. Which relay host offers durable storage without surprise billing or sleep-induced loss? Who owns the account and retention policy?
+2. The implemented host recipe is one always-on Fly machine with a SQLite volume (`relay/fly.toml`: `auto_stop_machines = "off"`, `min_machines_running = 1`). Who owns the Fly account, and who accepts the idle-machine cost, is still open. Relay retention itself is question 9.
 3. Can the actual Grok Bot routine call claim and complete through a sanctioned authenticated HTTP/MCP interface? Prove this before feature expansion.
 4. What exact standing tasks/targets does N authorize, including executive usage ceilings and escalation priority policy?
-5. How will each executive's callback credential be provisioned securely, distinct from the webhook sender key? Who rotates keys?
+5. **Open: per-target callback keys.** The built relay has one `DOME_RELAY_CALLBACK_KEY` for every target. It is different from `DOME_RELAY_KEY` and from `DOME_RELAY_GROK_KEY`. A separate key per target, and who rotates keys, are not decided.
 6. The MVP uses status retrieval in the origin conversation. Can automatic reinjection be proven on the pinned Hermes build after session rotation/restart? `ctx.inject_message` is UNVERIFIED; documented `pre_llm_call` injection is ephemeral and current-turn only, not persisted origin-session delivery.
-7. Is default one concurrent job/target, three attempts and a one-hop limit acceptable? What deadline and heartbeat thresholds suit the demo?
-8. Who manually reconciles uncertain executive claims after a crash? Do not auto-reclaim arbitrary work.
-9. Who may inspect stored briefs/results and what deletion/retention policy applies to both stores?
+7. **Resolved.** One outstanding accepted or held job per target, three wake attempts (5s then 15s plus up to 1s of jitter), one hop (`hop` 0 or 1, no parent), and expiry 30 minutes from server receive time. A local-worker heartbeat threshold is still open because the plugin worker is not built.
+8. **Resolved.** Do not auto-reclaim a crashed executive claim. The claim stands until `POST /jobs/{job_id}/cancel` or the 30 minute expiry.
+9. **Relay retention is resolved. A purge tool is still open.** The relay deletes stored task text when the wake attempt finishes. Results remain in the volume SQLite file until an operator deletes that file. There is no purge or deletion API. Who may inspect stored results, and what retention applies to the plugin's own database, are still open.
 10. Publication approval: confirm exact main-branch spec/manifest edits and use of a public repository; no upstream PR or demo post is included here.
+
+Known open items, called out so they are not treated as decided:
+
+- Per-target callback keys. Today every target shares one `DOME_RELAY_CALLBACK_KEY`.
+- A purge tool. Nothing in the relay deletes stored results except deleting the SQLite file by hand.
 
 ## Sources (read November 7, 2026)
 
