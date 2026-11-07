@@ -35,7 +35,7 @@ The Hermes plugin (not built yet) must read secrets only through `agent.secret_s
 
 The relay process in `relay/` is different. It runs on Fly, and Fly hands it secrets as environment variables. Those values stay out of this repo. See [The relay](#the-relay) below.
 
-The design draft is in [SPEC.md](SPEC.md). The plugin still does not run. The relay service does.
+The contract is in [SPEC.md](SPEC.md). The plugin still does not run. The relay service does. The plugin must not wake Grok and must not hold the Grok webhook URL or key.
 
 ## The relay
 
@@ -119,16 +119,9 @@ An always-on machine can cost money even when idle. Check Fly's current price fo
 
 No telemetry, no self-updater, no shell, and no reading of unrelated files. It does not fetch artifact links. It does not follow webhook redirects. It does not send the Grok key anywhere except the configured webhook.
 
-### Choices where the spec was open
+### Contract
 
-These are written down so the plugin side can match them. They are also listed on the pull request.
-
-- The spec's complete path is `POST /complete`. This service uses `POST /jobs/{job_id}/complete`, which is the path the task asked for. `callback_url` must be that exact URL.
-- The spec says the plugin owns the Grok wake and the relay does not need the Grok key. This service wakes Grok when a job is registered, because that is what this task asked for. Do not also wake from the plugin or the routine will start twice. The claim step still lets only one of those runs do the work.
-- The identity hash is SHA-256 of canonical JSON (sorted keys, no spaces, UTF-8) of the envelope with `attempt` removed, after timestamps are normalized to `YYYY-MM-DDTHH:MM:SSZ`. Same job id + same hash is a duplicate. Same job id + different hash is a conflict. The spec did not name the algorithm.
-- One callback key for the executive, not a different key per target. The spec leaves per-target keys open.
-- `hop` may be 0 or 1. `hop` of 2 or more, or any `parent_job_id`, is refused and does not wake Grok.
-- This deploy is one owner. It does not separate Hermes profiles. The plugin still has to do that in its own database.
+Registration, claim, complete, the identity hash, expiry, hop, and retention are specified in [SPEC.md](SPEC.md). This deploy is one owner. The plugin still has to keep Hermes profiles apart in its own database. A separate callback key per target, and a tool that deletes stored results, are still open.
 
 ## License
 
