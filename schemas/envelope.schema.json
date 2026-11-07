@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nerdcakes/hermes-dome-relay/schemas/envelope.schema.json",
+  "title": "Dome Relay envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job_id", "from", "target", "brief", "priority", "deadline", "callback_url", "artifacts", "created_at", "attempt"],
+  "properties": {
+    "job_id": {"type": "string", "format": "uuid"},
+    "from": {"type": "string", "minLength": 1, "maxLength": 128},
+    "target": {"type": "string", "pattern": "^[a-z0-9_-]{1,64}$"},
+    "brief": {"type": "string", "minLength": 1, "maxLength": 16000},
+    "priority": {"enum": ["normal", "high", "urgent"]},
+    "deadline": {"type": "string", "format": "date-time"},
+    "callback_url": {"type": "string", "format": "uri", "maxLength": 2048},
+    "artifacts": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "url"],
+        "properties": {
+          "label": {"type": "string", "maxLength": 128},
+          "url": {"type": "string", "format": "uri", "maxLength": 2048}
+        }
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "attempt": {"type": "integer", "minimum": 1, "maximum": 3}
+  }
+}

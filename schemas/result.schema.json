@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nerdcakes/hermes-dome-relay/schemas/result.schema.json",
+  "title": "Dome Relay result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job_id", "status", "result", "completed_at"],
+  "properties": {
+    "job_id": {"type": "string", "format": "uuid"},
+    "status": {"enum": ["done", "held", "failed"]},
+    "result": {"type": "string", "maxLength": 32000},
+    "completed_at": {"type": "string", "format": "date-time"}
+  }
+}
