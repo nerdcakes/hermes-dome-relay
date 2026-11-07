@@ -1,0 +1,2 @@
+# Only needed on a laptop to run pytest. The Fly image does not install this.
+pytest==9.2.0

@@ -1,0 +1,53 @@
+# Dome Relay on Fly.io.
+#
+# Edit two lines if you need to: `app` (must be unique on Fly) and `primary_region`
+# (pick a city close to you). The volume you create must use that same region.
+#
+# Do not put keys or URLs in this file. Those are Fly secrets. See the README.
+#
+# SQLite can be mounted on one machine only. Keep the app at one machine
+# (`fly scale count 1`). A second machine cannot share the database file.
+
+app = "dome-relay"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Not a secret. This is the file on the volume mounted below.
+  DOME_RELAY_DB = "/data/dome-relay.db"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # "off" means Fly will not stop this machine when it is idle.
+  # If it slept, a webhook wake could be missed while the machine was booting.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  # Belt and braces: even if auto-stop were turned back on, keep one machine up.
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
+# Replace the single machine in place. This app has a volume, so it must not
+# try to run two copies at once (bluegreen and canary cannot use a volume).
+[deploy]
+  strategy = "rolling"
+  max_unavailable = 1
+
+[mounts]
+  # `source` must match the name passed to `fly volumes create`.
+  # Create that volume before the first deploy. This file does not create it
+  # by itself, so a missing volume fails the deploy instead of making a second disk.
+  source = "dome_relay_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
