@@ -1,12 +1,42 @@
-# Plugin manifest (placeholder format).
-# TODO: match the exact schema Hermes expects once confirmed from the Hermes docs.
+# Design-stage native manifest. Still NOT a loadable plugin until the root
+# __init__.py implements register(ctx). Implemented registrations are empty.
 name: dome-relay
-version: 0.1.0
-description: Structured escalation briefs and handoffs between agents.
+version: "0.1.0"
+manifest_version: 2
+description: Structured escalation briefs and handoffs between established agents.
 author: Team Astrum (nerdcakes)
 license: MIT
-entrypoint: dome_relay
-config:
-  # Values come from environment variables, never from this file.
-  relay_url_env: DOME_RELAY_URL
-  relay_key_env: DOME_RELAY_KEY
+homepage: https://github.com/nerdcakes/hermes-dome-relay
+tags: [automation, escalation]
+provides_tools: []
+provides_hooks: []
+capabilities: []
+config_schema:
+  relay_url:
+    type: str
+    default: ""
+    description: Approved HTTPS callback relay origin; no credentials in URLs.
+  grok_webhook_url:
+    type: str
+    default: ""
+    description: Approved routine POST URL; never include sender key here.
+  callback_host:
+    type: str
+    default: ""
+    description: Exact allowlisted relay hostname.
+  grok_key:
+    type: secret
+    env: DOME_RELAY_GROK_KEY
+    description: Grok Bot routine sender key; read with get_secret.
+  relay_key:
+    type: secret
+    env: DOME_RELAY_KEY
+    description: Plugin registration and result-consumer key, not executive callback key.
+  max_attempts:
+    type: int
+    default: 3
+  target_concurrency:
+    type: int
+    default: 1
+# Add requires_hermes only after testing a released baseline.
+# Add implemented tool/hook declarations together with their registrations.
