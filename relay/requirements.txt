@@ -1,0 +1,5 @@
+# Runtime libraries for the relay process. Nothing secret belongs in this file.
+# Tests use relay/requirements-dev.txt and are not installed in the Fly image.
+fastapi==0.162.2
+uvicorn==0.54.0
+httpx==0.28.1
