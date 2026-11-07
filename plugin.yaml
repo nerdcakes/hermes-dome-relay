@@ -1,0 +1,12 @@
+# Plugin manifest (placeholder format).
+# TODO: match the exact schema Hermes expects once confirmed from the Hermes docs.
+name: dome-relay
+version: 0.1.0
+description: Structured escalation briefs and handoffs between agents.
+author: Team Astrum (nerdcakes)
+license: MIT
+entrypoint: dome_relay
+config:
+  # Values come from environment variables, never from this file.
+  relay_url_env: DOME_RELAY_URL
+  relay_key_env: DOME_RELAY_KEY
