@@ -2,20 +2,24 @@
 
 A [Hermes Agent](https://github.com/NousResearch) plugin from **Team Astrum** that passes structured escalation briefs between agents, so a cheap always-on dispatcher can hand real work to the right specialist and get results back.
 
-> Status: early scaffold for the Nous hackathon (deadline Wed Nov 11, 2026, 12:00 PM HST). Nothing here runs yet.
+> Status: the Hermes plugin and the relay both run. Target Hermes release: **v0.23.0** (`requires_hermes: ">=0.23.0"`). Hackathon deadline: Wed Nov 11, 2026, 12:00 PM HST.
 
-## What it will do
+## What it does
 
-- **Send a brief**: package a task as JSON (`job_id`, `from`, `brief`, `priority`, optional `callback_url`) and POST it to another agent's inbox.
-- **Receive a result**: accept the reply on a callback URL and hand it back to the original agent.
-- **Hold local work**: tasks tagged `local` wait in a queue until the home rig is online instead of failing.
+- **Escalate**: the Hermes agent saves a job, and a worker registers it with the relay (`POST /jobs`). The relay, not this plugin, wakes the Grok Bot executive.
+- **Status**: the same conversation asks for the job and gets the latest result (`GET /results` on the relay, saved in the profile database).
+- **Cancel**: stop retries and ask the relay to cancel. A cancel cannot undo a Grok run that already started.
+- **Hold local work**: a job tagged `local` waits until this machine's worker has checked in recently.
+
+A job is task text and optional reference links. It does not grant authority to post, send messages, spend money, or touch credentials. The executive only does what its own saved routine already allows.
 
 ## Repo layout
 
 | File | What it is |
 | --- | --- |
 | `plugin.yaml` | The plugin's name, version and settings. Hermes reads this. |
-| `dome_relay/__init__.py` | The plugin code (a stub for now). |
+| `__init__.py` | Hermes loads `register(ctx)` from this file. |
+| `dome_relay/` | Tools, the worker, and the relay client. |
 | `relay/` | The always-on callback service (the part that runs on Fly). |
 | `SPEC.md` | The design contract. |
 | `LICENSE` | MIT: anyone can use or change this, with credit. |
@@ -29,13 +33,108 @@ A [Hermes Agent](https://github.com/NousResearch) plugin from **Team Astrum** th
 
 ## Security
 
-Never commit URLs, keys or tokens.
+Never commit URLs, keys, or tokens.
 
-The Hermes plugin (not built yet) must read secrets only through `agent.secret_scope.get_secret(...)` (Hermes catalog rule 11). Set `relay_url` in plugin config under `plugins.entries.dome-relay.settings`. The plugin must not read `.env`, `auth.json`, or `os.environ`.
+The plugin's only secret is `DOME_RELAY_KEY`. It reads that name through `agent.secret_scope.get_secret`. It does not open a dotenv file, `auth.json`, or the process environment itself. Non-secret settings (`relay_url`, `sender`, and the rest) live under `plugins.entries.dome-relay.settings`.
 
-The relay process in `relay/` is different. It runs on Fly, and Fly hands it secrets as environment variables. Those values stay out of this repo. See [The relay](#the-relay) below.
+The relay process in `relay/` is different. It runs on Fly, and Fly hands it secrets as environment variables. Those values stay out of this repo. The plugin must not wake Grok and must not hold the Grok webhook URL or key. See [The relay](#the-relay) below.
 
-The contract is in [SPEC.md](SPEC.md). The plugin still does not run. The relay service does. The plugin must not wake Grok and must not hold the Grok webhook URL or key.
+The contract is in [SPEC.md](SPEC.md).
+
+## Use the plugin
+
+You need [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/installation) **v0.23.0** or newer. These steps use placeholders. Put your own relay origin and key in Hermes, not in this repo.
+
+### 1. Install and enable
+
+From a clone of this repo:
+
+```bash
+mkdir -p ~/.hermes/plugins
+ln -s "$(pwd)" ~/.hermes/plugins/dome-relay
+hermes plugins enable dome-relay
+```
+
+Hermes reads `plugin.yaml` and the `__init__.py` beside it. Check the wiring:
+
+```bash
+hermes plugins doctor ~/.hermes/plugins/dome-relay --ci
+```
+
+### 2. Point it at your relay
+
+`relay_url` is the relay's public origin: `https`, no path, and no key in the URL. It must be the same origin the relay was given as its public origin, because every job's callback is `{relay_url}/jobs/{job_id}/complete`.
+
+```bash
+hermes config set plugins.entries.dome-relay.settings.relay_url https://relay.example
+hermes config set plugins.entries.dome-relay.settings.sender celeste
+```
+
+`sender` is a label in the task JSON. It is not a secret. Leave `hop` at `1` (only `0` or `1` is allowed).
+
+### 3. Set the one secret
+
+The plugin needs `DOME_RELAY_KEY`. That key can register a job, cancel one, and read results. It cannot claim or complete a job, and it is not the Grok wake key.
+
+In the Hermes Desktop app, open the dome-relay plugin settings and fill in **Relay key**. Hermes stores it for you. From a terminal, add `DOME_RELAY_KEY` to the secret file Hermes already loads for the active profile, then start Hermes again. Do not paste the value into `plugin.yaml`, a chat, or this repo.
+
+### 4. A short demo
+
+Two terminals. No real job text that posts, pays, or reads keys.
+
+```bash
+hermes dome-relay worker
+```
+
+Leave that running. In a Hermes chat, ask the agent to escalate a harmless research question:
+
+- tool: `dome_relay_escalate`
+- target: `research`
+- brief: a short public question
+- priority: `normal`
+
+The tool returns a `job_id` and `state` right away (`queued`). The worker registers the job. The relay wakes the executive. Then ask for status:
+
+- tool: `dome_relay_status`
+- `job_id`: the id from the first call
+
+You should see `queued`, then `accepted` (a run started, the work is not finished yet), then `done` with the result text. Asking again with the same `job_id` and the same brief returns the same job (`deduped: true`) and does not start a second run.
+
+Stop the worker with Ctrl-C. A result that arrives while it is stopped stays on the relay. Start the worker again and status shows it. The profile database is outside the plugin folder, so a plugin update does not delete it.
+
+`execution_location: local` waits until this machine's worker heartbeat is fresh (60 seconds, unless you change `local_heartbeat_seconds`). The spec left that window open; 60 seconds is this plugin's choice. `hermes dome-relay ready` refreshes the heartbeat without a poll.
+
+### What you can turn on later
+
+By default the only way back into the chat is `dome_relay_status`. Two optional switches exist:
+
+- `inject_context` (default false): before a turn, `pre_llm_call` can add newly finished results for **this** conversation to that turn. It is not a saved message, and it is not sent to some other chat.
+- `inject_message` (default false): the plugin may call `ctx.inject_message`. On a gateway that also needs `plugins.entries.dome-relay.allow_gateway_injection: true`, which is a host grant, not a plugin setting. If Hermes returns false, the plugin stops trying and status still works.
+
+```bash
+hermes config set plugins.entries.dome-relay.settings.inject_context false
+hermes config set plugins.entries.dome-relay.settings.inject_message false
+```
+
+## What a job is not allowed to do
+
+The model can set the target, the brief, the priority, an optional deadline, optional https links, an optional job id, and `cloud` or `local`. It cannot set the sender, the callback URL, the hop, or any credential.
+
+Links are references. The plugin does not fetch them, and it rejects a query string or a password in the URL. Nothing in the job JSON authorizes posting, sending a message, spending money, or reading credentials. If the executive is not allowed to do the task, the result should be `held` or `failed`, not a silent approval.
+
+## Disclosures
+
+- Job text is sent to the relay you configure. The relay, not this plugin, forwards that text to the Grok Bot webhook. A successful wake spends Grok Bot usage.
+- Result text is stored on the relay and copied into this profile's plugin database when the worker or a status call reads it.
+- The only plugin credential is `DOME_RELAY_KEY`, via Hermes secret scope. The Grok key and the executive callback key stay on the relay and the executive.
+- Local state is a SQLite file under the active Hermes profile (`plugin-data/dome-relay`). The relay keeps its own SQLite file on the Fly volume. This version has no purge tool. Delete those files yourself if you want the text gone. The relay already deletes task text after the wake attempt; results stay until the database file is deleted.
+- The worker is explicit: `hermes dome-relay worker`. It polls every 15 seconds while a job is open, and waits longer when idle or the relay cannot be reached. Registration retries are 3 attempts, 5s then 15s plus up to 1s of jitter, honoring `Retry-After`. 401 and 403 are not retried.
+- Third-party services: your relay host, and Grok Bot when the relay wakes a routine. An always-on Fly machine can cost money while idle. See [The relay](#the-relay).
+- No telemetry, no self-updater, no shell, and no reading of unrelated files.
+
+If any of that changes, this section has to change with it.
+
+A catalog entry is a separate, later change. It is not part of this plugin.
 
 ## The relay
 
@@ -67,9 +166,11 @@ Other locked rules: one accepted job at a time per target; one hop (a result can
 
 The database file path is `DOME_RELAY_DB` (already set in `relay/fly.toml` to `/data/dome-relay.db`). That one is not a secret.
 
+This deploy is one owner. The plugin keeps Hermes profiles apart in its own database. A separate callback key per target, and a tool that deletes stored results, are still open.
+
 ### Run the tests
 
-From the repo root, with Python 3.12:
+From the repo root, with Python 3.11 or newer:
 
 ```bash
 python3 -m venv .venv
@@ -121,7 +222,17 @@ No telemetry, no self-updater, no shell, and no reading of unrelated files. It d
 
 ### Contract
 
-Registration, claim, complete, the identity hash, expiry, hop, and retention are specified in [SPEC.md](SPEC.md). This deploy is one owner. The plugin still has to keep Hermes profiles apart in its own database. A separate callback key per target, and a tool that deletes stored results, are still open.
+Registration, claim, complete, the identity hash, expiry, hop, and retention are specified in [SPEC.md](SPEC.md).
+
+### Fake round trip
+
+`scripts/e2e.py` runs one job through the plugin and the relay with a fake executive. It prints a short job id and a status word. It does not take a key as an argument.
+
+```bash
+python3 scripts/e2e.py
+```
+
+`--live` is refused unless you also pass `--i-understand-this-wakes-a-real-executive`, because a live run wakes a real executive and spends usage. Even then, this script does not read a key from the command line.
 
 ## License
 

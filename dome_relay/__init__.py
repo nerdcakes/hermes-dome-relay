@@ -1,20 +1,32 @@
-"""dome_relay: Team Astrum's Hermes plugin for agent-to-agent escalation.
+"""Helpers for the Dome Relay Hermes plugin.
 
-Stub only. The real hooks get wired in once the Hermes plugin API is confirmed.
+The loader entrypoint is the ``__init__.py`` next to ``plugin.yaml``. This
+package builds envelopes and talks to the relay. It does not wake Grok.
 """
+
+from __future__ import annotations
+
+from .hashutil import identity_hash
+
 
 __version__ = "0.1.0"
 
 
-def build_brief(job_id: str, sender: str, brief: str, priority: str = "normal",
-                callback_url: str | None = None) -> dict:
-    """Package a task as the JSON brief the relay sends."""
-    payload = {"job_id": job_id, "from": sender, "brief": brief, "priority": priority}
-    if callback_url:
-        payload["callback_url"] = callback_url
-    return payload
+def build_envelope(job_id: str, sender: str, target: str, brief: str, priority: str, deadline: str, callback: str, artifacts: list, created_at: str, attempt: int = 1) -> dict:
+    """Build the JSON object the relay stores. ``attempt`` is not part of the hash."""
+    return {
+        "job_id": job_id,
+        "from": sender,
+        "target": target,
+        "brief": brief,
+        "priority": priority,
+        "deadline": deadline,
+        "callback_url": callback,
+        "artifacts": artifacts,
+        "created_at": created_at,
+        "attempt": attempt,
+    }
 
 
-def send_brief(payload: dict) -> dict:
-    """POST a brief to the relay. Not implemented yet."""
-    raise NotImplementedError("send_brief is coming next")
+def envelope_hash(envelope: dict) -> str:
+    return identity_hash(envelope)

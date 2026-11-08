@@ -1,37 +1,86 @@
-# Design-stage native manifest. Still NOT a loadable plugin until the root
-# __init__.py implements register(ctx). Implemented registrations are empty.
+# Native Hermes plugin. register(ctx) lives in the __init__.py next to this file.
 name: dome-relay
 version: "0.1.0"
 manifest_version: 2
-description: Structured escalation briefs and handoffs between established agents.
+description: >
+  Escalate a task to another agent through the Dome Relay and read the result
+  back in the conversation that sent it. This plugin does not wake Grok and
+  does not hold the Grok key.
 author: Team Astrum (nerdcakes)
 license: MIT
 homepage: https://github.com/nerdcakes/hermes-dome-relay
 tags: [automation, escalation]
-provides_tools: []
-provides_hooks: []
+requires_hermes: ">=0.23.0"
+provides_tools:
+  - dome_relay_escalate
+  - dome_relay_status
+  - dome_relay_cancel
+provides_hooks:
+  - pre_llm_call
 capabilities: []
 config_schema:
-  # The Grok routine URL and key are Fly secrets on the relay process only
-  # (DOME_RELAY_GROK_WEBHOOK_URL and DOME_RELAY_GROK_KEY). This plugin must
-  # not declare them, read them, or wake Grok.
+  # The Grok routine URL and key are Fly secrets on the relay process only.
+  # This plugin must not declare them, read them, or wake Grok.
   relay_url:
     type: str
     default: ""
-    description: Approved HTTPS callback relay origin; no credentials in URLs.
+    description: Approved relay origin (https, no path, no credentials). This is also the callback host.
   callback_host:
     type: str
     default: ""
-    description: Exact allowlisted relay hostname.
+    description: Optional exact hostname. When set, relay_url's host must match it.
+  sender:
+    type: str
+    default: hermes
+    description: Audit label stored in the envelope "from" field. Not a secret.
   relay_key:
     type: secret
     env: DOME_RELAY_KEY
-    description: Plugin registration and result-consumer key. Not the executive callback key and not the Grok wake key.
+    description: Plugin registration and result-read key. Not the executive callback key and not the Grok wake key.
+  hop:
+    type: int
+    default: 1
+    description: Registration hop. Only 0 or 1 is accepted. The model cannot set this.
   max_attempts:
     type: int
     default: 3
+    description: Fixed at 3 by the relay contract. Higher settings are ignored.
   target_concurrency:
     type: int
     default: 1
-# Add requires_hermes only after testing a released baseline.
-# Add implemented tool/hook declarations together with their registrations.
+    description: Fixed at one outstanding job per target. Higher settings are ignored.
+  poll_interval_seconds:
+    type: int
+    default: 15
+    description: How often the worker polls while a job is open. Values under 15 are raised to 15.
+  idle_backoff_seconds:
+    type: int
+    default: 60
+    description: How long the worker waits when no job is open.
+  unreachable_backoff_seconds:
+    type: int
+    default: 60
+    description: First wait after the relay cannot be reached. The wait doubles up to 5 minutes.
+  local_heartbeat_seconds:
+    type: int
+    default: 60
+    description: >
+      Local-only jobs stay queued until the worker heartbeat is at least this
+      fresh. The spec left the number open; 60 seconds is this plugin's choice.
+  inject_context:
+    type: bool
+    default: false
+    description: >
+      When true, pre_llm_call adds newly finished results for this conversation
+      to the current turn. Default false: read results with dome_relay_status.
+  inject_message:
+    type: bool
+    default: false
+    description: >
+      When true, the plugin may call ctx.inject_message for a finished result.
+      Gateway delivery also needs plugins.entries.dome-relay.allow_gateway_injection
+      set to true on the host. A refusal is ignored and status still works.
+  allow_loopback:
+    type: bool
+    default: false
+    description: Local tests only. Allows an http loopback relay. Leave false for a real deployment.
