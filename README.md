@@ -47,18 +47,23 @@ You need [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-start
 
 ### 1. Install and enable
 
-From a clone of this repo:
+Hermes loads plugins from the active profile's `plugins` folder, `$HERMES_HOME/plugins`. On a default local install that is `~/.hermes/plugins`. Hosted or custom setups may point `HERMES_HOME` elsewhere (for example `/opt/data`), so check with `hermes config path` (the config file sits in `HERMES_HOME`).
+
+Clone this repo somewhere permanent (not a temp folder; the plugin is a symlink to the clone), then run these from inside the clone, because `$(pwd)` is the link target:
 
 ```bash
-mkdir -p ~/.hermes/plugins
-ln -s "$(pwd)" ~/.hermes/plugins/dome-relay
+git clone https://github.com/nerdcakes/hermes-dome-relay
+cd hermes-dome-relay
+PLUGIN_DIR="${HERMES_HOME:-$HOME/.hermes}/plugins"
+mkdir -p "$PLUGIN_DIR" && ln -s "$(pwd)" "$PLUGIN_DIR/dome-relay"
 hermes plugins enable dome-relay
 ```
 
 Hermes reads `plugin.yaml` and the `__init__.py` beside it. Check the wiring:
 
 ```bash
-hermes plugins doctor ~/.hermes/plugins/dome-relay --ci
+hermes plugins doctor "$PLUGIN_DIR/dome-relay" --ci
+hermes plugins validate
 ```
 
 ### 2. Point it at your relay
