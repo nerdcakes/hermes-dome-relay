@@ -127,6 +127,8 @@ The model can set the target, the brief, the priority, an optional deadline, opt
 
 Links are references. The plugin does not fetch them, and it rejects a query string or a password in the URL. Nothing in the job JSON authorizes posting, sending a message, spending money, or reading credentials. If the executive is not allowed to do the task, the result should be `held` or `failed`, not a silent approval.
 
+A completed job is a result, not an approval. If the result is code — a branch or a pull request — merging it stays a separate human decision, made outside the relay. The relay tracks the callback; it does not grant the yes.
+
 ## Disclosures
 
 - Job text is sent to the relay you configure. The relay, not this plugin, forwards that text to the Grok Bot webhook. A successful wake spends Grok Bot usage.
