@@ -59,12 +59,16 @@ mkdir -p "$PLUGIN_DIR" && ln -s "$(pwd)" "$PLUGIN_DIR/dome-relay"
 hermes plugins enable dome-relay
 ```
 
+That block is Bash. In fish, from the clone: `set -l plugin_dir "$HERMES_HOME/plugins"; mkdir -p $plugin_dir; ln -s (pwd) $plugin_dir/dome-relay`. In PowerShell: `New-Item -ItemType SymbolicLink -Path "$env:HERMES_HOME\plugins\dome-relay" -Target (Get-Location)`. If `HERMES_HOME` is unset, use the default profile directory `~/.hermes` (`$HOME/.hermes` in fish). This is only another way to write the symlink. It does not add Windows support.
+
 Hermes reads `plugin.yaml` and the `__init__.py` beside it. Check the wiring:
 
 ```bash
 hermes plugins doctor "$PLUGIN_DIR/dome-relay" --ci
-hermes plugins validate
+hermes plugins validate "$PLUGIN_DIR/dome-relay"
 ```
+
+`hermes plugins validate` requires that plugin-directory path. Without it, Hermes reports a missing argument and does not check the plugin.
 
 ### 2. Point it at your relay
 
@@ -103,18 +107,24 @@ The tool returns a `job_id` and `state` right away (`queued`). The worker regist
 - tool: `dome_relay_status`
 - `job_id`: the id from the first call
 
-You should see `queued`, then `accepted` (a run started, the work is not finished yet), then `done` with the result text. Asking again with the same `job_id` and the same brief returns the same job (`deduped: true`) and does not start a second run.
+You should see `queued`, then `accepted` (a run started, the work is not finished yet), then `done` with the result text. A finished relay handoff (`accepted`, or a callback stored on the relay) is not the implementation finishing: a long coding job can still be underway, and `done` is the result text, not a merge. Asking again with the same `job_id` and the same brief returns the same job (`deduped: true`) and does not start a second run. Omitting `deadline` on that repeat is still the same job; the plugin keeps the deadline it saved the first time.
 
 Stop the worker with Ctrl-C. A result that arrives while it is stopped stays on the relay. Start the worker again and status shows it. The profile database is outside the plugin folder, so a plugin update does not delete it.
 
 `execution_location: local` waits until this machine's worker heartbeat is fresh (60 seconds, unless you change `local_heartbeat_seconds`). The spec left that window open; 60 seconds is this plugin's choice. `hermes dome-relay ready` refreshes the heartbeat without a poll.
 
+The worker command exists only when this plugin loads in-process. That is the Hermes default (`plugins.isolation: in_process`) and the supported deployment. `plugins.isolation: host` skips `register_cli_command`, and that registration is the only worker entrypoint, so `hermes dome-relay` is not installed. Leave Hermes terminal and Docker sandbox settings as they are; this is about where the plugin process loads, not about command sandboxing.
+
+Status reads the job that belongs to this conversation. Hermes v0.23.0 passes the physical `session_id` and does not pass a conversation id that stays put when rotating compression (`compression.in_place: false`) replaces that id. The public stable `conversation_id` was added to Hermes after v0.23.0, so this plugin does not call Hermes session internals to walk the lineage. It records an edge only from the `post_compaction` hook, when Hermes reports a new session id and a different previous id. A later status, cancel, or repeat escalate from that replacement session can see the same job. A different session in the same profile cannot. In-place compression (the Hermes default) keeps the session id, so no edge is required. If the hook did not run, a call that only has the new session id is `not_found`.
+
+`expired` on status means the plugin stopped waiting and no relay result was stored. If the relay accepted a result and this profile has stored it, status reports that result (`done`, `held`, or `failed`) even when the local deadline has already passed. A canceled job still does not return a result.
+
 ### What you can turn on later
 
-By default the only way back into the chat is `dome_relay_status`. Two optional switches exist:
+`dome_relay_status` is the supported way to read a result. Two optional switches exist and stay off unless you turn them on. They are not a supported push path. On a gateway, injection wants a routing key, and this plugin does not substitute the transcript session id or promise that the message was delivered.
 
 - `inject_context` (default false): before a turn, `pre_llm_call` can add newly finished results for **this** conversation to that turn. It is not a saved message, and it is not sent to some other chat.
-- `inject_message` (default false): the plugin may call `ctx.inject_message`. On a gateway that also needs `plugins.entries.dome-relay.allow_gateway_injection: true`, which is a host grant, not a plugin setting. If Hermes returns false, the plugin stops trying and status still works.
+- `inject_message` (default false): the plugin may call `ctx.inject_message` only when Hermes already passed a gateway `session_key`. On a gateway that also needs `plugins.entries.dome-relay.allow_gateway_injection: true`, which is a host grant, not a plugin setting. If Hermes returns false, the plugin does not retry that note, and status still works. Leave this off.
 
 ```bash
 hermes config set plugins.entries.dome-relay.settings.inject_context false

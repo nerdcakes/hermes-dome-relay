@@ -76,7 +76,7 @@ def test_register_wires_the_manifest_and_does_not_connect(monkeypatch):
         "dome_relay_status",
         "dome_relay_cancel",
     ]
-    assert [name for name, _callback in ctx.hooks] == ["pre_llm_call"]
+    assert [name for name, _callback in ctx.hooks] == ["pre_llm_call", "post_compaction"]
     assert ctx.commands == ["dome-relay"]
     hook = ctx.hooks[0][1]
     assert any(
@@ -198,3 +198,86 @@ def test_pre_llm_call_is_off_until_configured_and_inject_false_degrades(monkeypa
     assert handlers["pre_llm_call"](session_id="sess-1", conversation_id="conv-1") is None
     assert ctx.injected == []
     opened.close()
+
+
+def test_parent_session_id_does_not_grant_injection_and_lineage_does(monkeypatch, tmp_path):
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from dome_relay.service import escalate
+    from dome_relay.storage import Store
+
+    conn = sqlite3.connect(tmp_path / "lineage.db")
+    opened = Store(conn)
+    opened.close = lambda: None
+    now = datetime(2026, 11, 7, 21, 0, tzinfo=timezone.utc)
+    settings = make_settings(inject_context=True, inject_message=False)
+    saved = escalate(
+        opened,
+        settings,
+        job_args(),
+        profile="default",
+        conversation_id="",
+        session_id="sess-a",
+        now=now,
+    )
+    opened.apply_result_batch(
+        [
+            {
+                "cursor": "c1",
+                "result": {
+                    "job_id": saved["job_id"],
+                    "status": "done",
+                    "result": "finished",
+                    "completed_at": "2026-11-07T21:05:00Z",
+                    "body_hash": "abc",
+                },
+            }
+        ],
+        "c1",
+        now,
+    )
+    monkeypatch.setattr("dome_relay.tools.open_store", lambda: opened)
+    monkeypatch.setattr("dome_relay.tools.load_settings_from_context", lambda _ctx: settings)
+    handlers = build_handlers(FakeCtx())
+    # The hook is given the original parent id. That is not ownership.
+    assert handlers["pre_llm_call"](session_id="sess-b", parent_session_id="sess-a") is None
+    handlers["post_compaction"](session_id="sess-b", old_session_id="sess-a", in_place=False)
+    # An unrelated session in the same profile still sees nothing, even if it
+    # names the original parent. Checked before the owner turn consumes the note.
+    assert handlers["pre_llm_call"](session_id="sess-other", parent_session_id="sess-a") is None
+    injected = handlers["pre_llm_call"](session_id="sess-b", parent_session_id="sess-a")
+    assert injected["context"].startswith("Dome Relay results")
+    assert "finished" in injected["context"]
+    # In-place compaction does not invent a second session.
+    handlers["post_compaction"](session_id="sess-a", old_session_id="")
+    status_raw = handlers["dome_relay_status"]({"job_id": saved["job_id"]}, session_id="sess-b")
+    assert json.loads(status_raw)["job_id"] == saved["job_id"]
+    denied = handlers["dome_relay_status"]({"job_id": saved["job_id"]}, session_id="sess-other")
+    assert json.loads(denied)["error"] == "not_found"
+    opened.close()
+
+
+class HostCtx(FakeCtx):
+    """Hermes plugins.isolation=host skips register_cli_command and still loads the plugin."""
+
+    def register_cli_command(self, name, help, setup_fn, handler_fn=None, **kwargs):
+        return None
+
+
+def test_host_isolation_has_no_worker_command_and_in_process_is_supported():
+    from dome_relay.worker import SUPPORTED_ISOLATION
+
+    assert SUPPORTED_ISOLATION == "in_process"
+    source = (ROOT / "dome_relay" / "tools.py").read_text(encoding="utf-8")
+    assert source.count("register_cli_command") == 1
+    assert "serve(" not in source
+    module = load_root()
+    host = HostCtx()
+    module.register(host)
+    assert host.commands == []
+    assert [name for name, _handler, _schema in host.tools] == [
+        "dome_relay_escalate",
+        "dome_relay_status",
+        "dome_relay_cancel",
+    ]

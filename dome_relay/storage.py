@@ -17,16 +17,54 @@ from .hashutil import format_utc, parse_utc
 
 
 PLUGIN_DB_NAME = "dome-relay"
+_MAX_SESSION_ID = 256
+_LINEAGE_HOPS = 32
 
 # A job we already handed to the relay still occupies the one slot for its target.
 # queued and held_local have not been sent, so they do not.
 SLOT_STATES = ("registered", "dispatching", "retry_wait", "accepted", "held", "uncertain")
 ACTIVE_STATES = SLOT_STATES + ("queued", "held_local")
 TERMINAL_STATES = ("done", "failed", "canceled", "expired", "rejected")
+EXECUTION_RESULTS = ("done", "held", "failed")
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _usable_session_id(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= _MAX_SESSION_ID
+        and "\x00" not in value
+        and value.strip() == value
+    )
+
+
+def _ids_share_origin(job: dict, conversation_id: str, session_id: str, ancestors) -> bool:
+    """True when the caller is this job's conversation, not merely the same profile.
+
+    A non-empty conversation id on both sides must be the same id. Session ids
+    match the id stored at escalate time, or a parent recorded from compaction.
+    """
+    stored_conv = job.get("conversation_id") or ""
+    stored_sess = job.get("session_id") or ""
+    if not isinstance(conversation_id, str):
+        conversation_id = ""
+    if not isinstance(session_id, str):
+        session_id = ""
+    if conversation_id and stored_conv and conversation_id != stored_conv:
+        return False
+    caller: set[str] = set()
+    if conversation_id:
+        caller.add(conversation_id)
+    if session_id:
+        caller.add(session_id)
+        caller.update(ancestors)
+    stored = {stored_conv, stored_sess} - {""}
+    if not caller or not stored or caller.isdisjoint(stored):
+        return False
+    return True
 
 
 class Store:
@@ -136,6 +174,14 @@ class Store:
                 owner TEXT NOT NULL,
                 until_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS session_lineage (
+                profile TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (profile, session_id)
+            );
             """
         )
 
@@ -222,19 +268,110 @@ class Store:
     def get_for_origin(self, job_id: str, profile: str, conversation_id: str, session_id: str) -> dict | None:
         """Return the job only when this profile and this conversation own it.
 
-        Hermes v0.23.0 tool calls carry ``session_id`` and not ``conversation_id``.
-        A later build may pass both. Either id may match the ids stored at escalate
-        time. An empty id never matches, so a call with no session cannot read a job.
+        Hermes v0.23.0 tool calls carry the physical ``session_id``. A later build
+        may also pass a stable ``conversation_id``. An empty id never matches, so
+        a call with no session cannot read a job. A replacement session matches
+        only through a compaction edge this profile recorded.
         """
         with self._lock:
             job = self._get(job_id)
-        if job is None or job["profile"] != profile:
-            return None
-        caller = {conversation_id, session_id} - {""}
-        stored = {job["conversation_id"], job["session_id"]} - {""}
-        if not caller or not stored or caller.isdisjoint(stored):
+        if job is None or not self.shares_origin(job, profile, conversation_id, session_id):
             return None
         return job
+
+    def shares_origin(self, job: dict, profile: str, conversation_id: str, session_id: str) -> bool:
+        if job["profile"] != profile:
+            return False
+        ancestors = self.lineage_ancestors(profile, session_id)
+        return _ids_share_origin(job, conversation_id, session_id, ancestors)
+
+    def note_session_lineage(self, profile: str, session_id: str, parent_session_id: str, now: datetime) -> bool:
+        """Record that Hermes compaction replaced ``parent_session_id`` with ``session_id``.
+
+        The first parent wins. A repeat of the same edge is accepted. A different
+        parent, a self-link, or a cycle is ignored. Empty ids record nothing,
+        which is what an in-place compaction reports.
+        """
+        if not isinstance(profile, str) or not profile.strip():
+            return False
+        profile = profile.strip()[:128]
+        if not _usable_session_id(session_id) or not _usable_session_id(parent_session_id):
+            return False
+        if session_id == parent_session_id:
+            return False
+        stamp = format_utc(now)
+        with self._tx():
+            row = self._conn.execute(
+                "SELECT parent_session_id FROM session_lineage WHERE profile = ? AND session_id = ?",
+                (profile, session_id),
+            ).fetchone()
+            if row is not None:
+                return row["parent_session_id"] == parent_session_id
+            if self._lineage_reaches_locked(profile, parent_session_id, session_id):
+                return False
+            self._conn.execute(
+                """
+                INSERT INTO session_lineage (profile, session_id, parent_session_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (profile, session_id, parent_session_id, stamp),
+            )
+            self._audit("session_lineage", None, {}, stamp)
+            return True
+
+    def lineage_ancestors(self, profile: str, session_id: str) -> tuple[str, ...]:
+        if not isinstance(profile, str) or not profile or not _usable_session_id(session_id):
+            return ()
+        profile = profile.strip()[:128]
+        found: list[str] = []
+        current = session_id
+        seen: set[str] = set()
+        with self._lock:
+            for _ in range(_LINEAGE_HOPS):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                row = self._conn.execute(
+                    "SELECT parent_session_id FROM session_lineage WHERE profile = ? AND session_id = ?",
+                    (profile, current),
+                ).fetchone()
+                if row is None:
+                    break
+                parent = str(row["parent_session_id"])
+                found.append(parent)
+                current = parent
+        return tuple(found)
+
+    def _lineage_reaches_locked(self, profile: str, start: str, target: str) -> bool:
+        current = start
+        seen: set[str] = set()
+        for _ in range(_LINEAGE_HOPS):
+            if not current or current in seen:
+                return current == target
+            if current == target:
+                return True
+            seen.add(current)
+            row = self._conn.execute(
+                "SELECT parent_session_id FROM session_lineage WHERE profile = ? AND session_id = ?",
+                (profile, current),
+            ).fetchone()
+            if row is None:
+                return False
+            current = str(row["parent_session_id"])
+        return True
+
+    def _latest_result_status_locked(self, job_id: str) -> str | None:
+        row = self._conn.execute(
+            """
+            SELECT status FROM result_inbox WHERE job_id = ?
+             ORDER BY CAST(substr(cursor, 2) AS INTEGER) DESC
+             LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["status"])
 
     def get(self, job_id: str) -> dict | None:
         with self._lock:
@@ -348,19 +485,34 @@ class Store:
 
     def expire_due(self, now: datetime) -> None:
         stamp = format_utc(now)
+        watched = ACTIVE_STATES + ("expired",)
         with self._tx():
             rows = self._conn.execute(
-                f"SELECT * FROM jobs WHERE state IN ({','.join('?' for _ in ACTIVE_STATES)})",
-                ACTIVE_STATES,
+                f"SELECT * FROM jobs WHERE state IN ({','.join('?' for _ in watched)})",
+                watched,
             ).fetchall()
             for row in rows:
                 job = dict(row)
-                if self._is_expired(job, now):
-                    self._conn.execute(
-                        "UPDATE jobs SET state = 'expired', brief = '', updated_at = ? WHERE job_id = ?",
-                        (stamp, job["job_id"]),
-                    )
-                    self._audit("expired", job["job_id"], {}, stamp)
+                waiting_over = job["state"] == "expired" or self._is_expired(job, now)
+                if not waiting_over:
+                    continue
+                outcome = self._latest_result_status_locked(job["job_id"])
+                if outcome in EXECUTION_RESULTS:
+                    # Local waiting can lapse after the relay already accepted a result.
+                    if job["state"] != outcome:
+                        self._conn.execute(
+                            "UPDATE jobs SET state = ?, brief = '', updated_at = ? WHERE job_id = ?",
+                            (outcome, stamp, job["job_id"]),
+                        )
+                        self._audit("execution_result", job["job_id"], {"status": outcome}, stamp)
+                    continue
+                if job["state"] == "expired":
+                    continue
+                self._conn.execute(
+                    "UPDATE jobs SET state = 'expired', brief = '', updated_at = ? WHERE job_id = ?",
+                    (stamp, job["job_id"]),
+                )
+                self._audit("expired", job["job_id"], {}, stamp)
 
     def promote_held_local(self, now: datetime, window_seconds: float) -> None:
         if not self.heartbeat_fresh(now, window_seconds):
@@ -587,7 +739,7 @@ class Store:
                     ),
                 )
                 stored += 1
-                if job["state"] not in ("canceled", "expired", "done", "failed"):
+                if job["state"] not in ("canceled", "done", "failed"):
                     self._conn.execute(
                         "UPDATE jobs SET state = ?, brief = '', updated_at = ? WHERE job_id = ?",
                         (result["status"], stamp, result["job_id"]),
@@ -640,28 +792,40 @@ class Store:
         }
 
     def unannounced_results(self, profile: str, conversation_id: str, session_id: str = "") -> list[dict]:
-        keys = [key for key in (conversation_id, session_id) if key]
-        if not keys:
-            return []
-        marks = ",".join("?" for _ in keys)
+        ancestors = self.lineage_ancestors(profile, session_id)
         with self._lock:
             rows = self._conn.execute(
-                f"""
-                SELECT inbox.cursor, inbox.job_id, inbox.status, inbox.result_text, inbox.completed_at
+                """
+                SELECT inbox.cursor, inbox.job_id, inbox.status, inbox.result_text, inbox.completed_at,
+                       jobs.conversation_id, jobs.session_id, jobs.profile
                   FROM result_inbox AS inbox
                   JOIN jobs ON jobs.job_id = inbox.job_id
                  WHERE inbox.announced = 0
                    AND jobs.profile = ?
                    AND jobs.state != 'canceled'
-                   AND (
-                        jobs.conversation_id IN ({marks})
-                        OR jobs.session_id IN ({marks})
-                   )
                  ORDER BY CAST(substr(inbox.cursor, 2) AS INTEGER)
                 """,
-                (profile, *keys, *keys),
+                (profile,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        kept = []
+        for row in rows:
+            job = {
+                "profile": row["profile"],
+                "conversation_id": row["conversation_id"],
+                "session_id": row["session_id"],
+            }
+            if not _ids_share_origin(job, conversation_id, session_id, ancestors):
+                continue
+            kept.append(
+                {
+                    "cursor": row["cursor"],
+                    "job_id": row["job_id"],
+                    "status": row["status"],
+                    "result_text": row["result_text"],
+                    "completed_at": row["completed_at"],
+                }
+            )
+        return kept
 
     def mark_announced(self, cursors: list[str], now: datetime) -> None:
         if not cursors:

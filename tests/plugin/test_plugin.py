@@ -119,6 +119,281 @@ def test_duplicate_id_returns_the_same_job_and_changed_content_conflicts(store, 
     assert changed.value.code == "conflict"
 
 
+def test_omitted_deadline_repeats_the_saved_job_and_a_new_deadline_conflicts(store, clock):
+    """A later identical escalate with no deadline must not mint a new deadline."""
+    settings = make_settings()
+    job_id = "00000000-0000-4000-8000-0000000000aa"
+    args = job_args(job_id=job_id)
+    first = escalate(
+        store, settings, args, profile=PROFILE, conversation_id="", session_id="sess-a", now=clock.now
+    )
+    stored_deadline = store.get(first["job_id"])["deadline"]
+    clock.advance(seconds=2)
+    again = escalate(
+        store, settings, args, profile=PROFILE, conversation_id="", session_id="sess-a", now=clock.now
+    )
+    assert again["deduped"] is True
+    assert again["job_id"] == first["job_id"]
+    assert store.get(first["job_id"])["deadline"] == stored_deadline
+    explicit = escalate(
+        store,
+        settings,
+        job_args(job_id=job_id, deadline=stored_deadline),
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-a",
+        now=clock.now,
+    )
+    assert explicit["deduped"] is True
+    # An explicit different timestamp is changed content.
+    with pytest.raises(Exception) as changed:
+        escalate(
+            store,
+            settings,
+            job_args(job_id=job_id, deadline=format_utc(clock.now + timedelta(minutes=10))),
+            profile=PROFILE,
+            conversation_id="",
+            session_id="sess-a",
+            now=clock.now,
+        )
+    assert changed.value.code == "conflict"
+
+
+def test_repeat_from_another_session_does_not_acknowledge_the_job(store, clock):
+    settings = make_settings()
+    job_id = "00000000-0000-4000-8000-0000000000bb"
+    deadline = format_utc(clock.now + timedelta(minutes=20))
+    first = escalate(
+        store,
+        settings,
+        job_args(job_id=job_id, deadline=deadline),
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-a",
+        now=clock.now,
+    )
+    with pytest.raises(Exception) as other:
+        escalate(
+            store,
+            settings,
+            job_args(job_id=job_id, deadline=deadline),
+            profile=PROFILE,
+            conversation_id="",
+            session_id="sess-b",
+            now=clock.now,
+        )
+    assert other.value.code == "not_found"
+    assert not hasattr(other.value, "state")
+    with pytest.raises(Exception) as hidden:
+        status(
+            store,
+            settings,
+            first["job_id"],
+            profile=PROFILE,
+            conversation_id="",
+            session_id="sess-b",
+            now=clock.now,
+        )
+    assert hidden.value.code == "not_found"
+    owner = status(
+        store,
+        settings,
+        first["job_id"],
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-a",
+        now=clock.now,
+    )
+    assert owner["job_id"] == first["job_id"]
+
+
+def test_stable_conversation_id_repeats_across_session_ids(store, clock):
+    settings = make_settings()
+    job_id = "00000000-0000-4000-8000-0000000000cc"
+    deadline = format_utc(clock.now + timedelta(minutes=20))
+    first = escalate(
+        store,
+        settings,
+        job_args(job_id=job_id, deadline=deadline),
+        profile=PROFILE,
+        conversation_id="conv-root",
+        session_id="sess-a",
+        now=clock.now,
+    )
+    again = escalate(
+        store,
+        settings,
+        job_args(job_id=job_id, deadline=deadline),
+        profile=PROFILE,
+        conversation_id="conv-root",
+        session_id="sess-b",
+        now=clock.now,
+    )
+    assert again["deduped"] is True
+    assert again["job_id"] == first["job_id"]
+    with pytest.raises(Exception) as other:
+        escalate(
+            store,
+            settings,
+            job_args(job_id=job_id, deadline=deadline),
+            profile=PROFILE,
+            conversation_id="conv-other",
+            session_id="sess-a",
+            now=clock.now,
+        )
+    assert other.value.code == "not_found"
+
+
+def test_verified_compaction_lineage_keeps_one_conversation(store, clock):
+    settings = make_settings()
+    saved = escalate(
+        store,
+        settings,
+        job_args(),
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-a",
+        now=clock.now,
+    )
+    with pytest.raises(Exception) as rotated:
+        status(
+            store,
+            settings,
+            saved["job_id"],
+            profile=PROFILE,
+            conversation_id="",
+            session_id="sess-b",
+            now=clock.now,
+        )
+    assert rotated.value.code == "not_found"
+    # A claimed parent id is not proof. Only a recorded compaction edge is.
+    assert store.note_session_lineage(PROFILE, "sess-b", "sess-a", clock.now) is True
+    found = status(
+        store,
+        settings,
+        saved["job_id"],
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-b",
+        now=clock.now,
+    )
+    assert found["job_id"] == saved["job_id"]
+    assert store.note_session_lineage(PROFILE, "sess-c", "sess-b", clock.now) is True
+    hopped = status(
+        store,
+        settings,
+        saved["job_id"],
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-c",
+        now=clock.now,
+    )
+    assert hopped["job_id"] == saved["job_id"]
+    repeated = escalate(
+        store,
+        settings,
+        job_args(job_id=saved["job_id"], deadline=store.get(saved["job_id"])["deadline"]),
+        profile=PROFILE,
+        conversation_id="",
+        session_id="sess-c",
+        now=clock.now,
+    )
+    assert repeated["deduped"] is True
+    assert repeated["job_id"] == saved["job_id"]
+    with pytest.raises(Exception) as unrelated:
+        status(
+            store,
+            settings,
+            saved["job_id"],
+            profile=PROFILE,
+            conversation_id="",
+            session_id="sess-other",
+            now=clock.now,
+        )
+    assert unrelated.value.code == "not_found"
+    assert store.note_session_lineage(PROFILE, "sess-e", "sess-d", clock.now) is True
+    with pytest.raises(Exception) as other_chain:
+        status(
+            store,
+            settings,
+            saved["job_id"],
+            profile=PROFILE,
+            conversation_id="",
+            session_id="sess-e",
+            now=clock.now,
+        )
+    assert other_chain.value.code == "not_found"
+    with pytest.raises(Exception) as other_profile:
+        status(
+            store,
+            settings,
+            saved["job_id"],
+            profile="other",
+            conversation_id="",
+            session_id="sess-b",
+            now=clock.now,
+        )
+    assert other_profile.value.code == "not_found"
+    # The same edge twice is a no-op. A different parent does not retarget the child.
+    assert store.note_session_lineage(PROFILE, "sess-b", "sess-a", clock.now) is True
+    assert store.note_session_lineage(PROFILE, "sess-b", "sess-stolen", clock.now) is False
+    # In-place compaction reports no previous id and records nothing.
+    assert store.note_session_lineage(PROFILE, "sess-a", "", clock.now) is False
+    assert store.note_session_lineage(PROFILE, "sess-a", "sess-a", clock.now) is False
+
+
+def test_late_pull_reports_the_relay_result_not_local_expiry(store, clock):
+    settings = make_settings()
+    saved = save(store, clock, settings, deadline=format_utc(clock.now + timedelta(minutes=10)))
+    relay, _transport = client_for(settings, [accepted(saved["job_id"])], clock)
+    dispatch_queued(store, relay, settings, clock.now)
+    assert store.get(saved["job_id"])["state"] == "accepted"
+    clock.advance(minutes=11)
+    page = {
+        "results": [
+            {
+                "cursor": "c1",
+                "result": {
+                    "job_id": saved["job_id"],
+                    "status": "done",
+                    "result": "finished before the relay deadline",
+                    "completed_at": "2026-11-07T21:09:00Z",
+                },
+            }
+        ],
+        "next_cursor": "c1",
+    }
+    puller, _transport = client_for(settings, [httpx.Response(200, json=page)], clock)
+    viewed = status(
+        store,
+        settings,
+        saved["job_id"],
+        profile=PROFILE,
+        conversation_id=CONVERSATION,
+        session_id="sess-1",
+        now=clock.now,
+        client=puller,
+    )
+    assert viewed["state"] == "done"
+    assert viewed["result"]["status"] == "done"
+    assert viewed["result"]["result"] == "finished before the relay deadline"
+    assert store.get(saved["job_id"])["state"] == "done"
+    store._conn.execute("UPDATE jobs SET state = 'expired' WHERE job_id = ?", (saved["job_id"],))
+    store._conn.commit()
+    repaired = status(
+        store,
+        settings,
+        saved["job_id"],
+        profile=PROFILE,
+        conversation_id=CONVERSATION,
+        session_id="sess-1",
+        now=clock.now,
+    )
+    assert repaired["state"] == "done"
+    assert repaired["result"]["status"] == "done"
+    assert store.get(saved["job_id"])["state"] == "done"
+
+
 def test_worker_registers_with_bearer_callback_and_hash(store, clock):
     settings = make_settings()
     saved = save(store, clock, settings)

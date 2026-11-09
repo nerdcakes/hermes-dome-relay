@@ -144,13 +144,21 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
         raise PluginError("invalid_config", "hop must be 0 or 1.")
     origin = _origin(settings)
     created_at = now.replace(microsecond=0)
-    deadline = _parse_deadline(args.get("deadline"), created_at, now)
     artifacts = _artifacts(args.get("artifacts"))
-    deadline_text = format_utc(deadline)
     created_text = format_utc(created_at)
     artifacts_json = json.dumps(artifacts, sort_keys=True)
+    supplied_deadline = args.get("deadline")
     existing = store.get(job_id) if supplied else None
     if existing is not None:
+        # Another session in this profile must not learn that the id exists.
+        if not store.shares_origin(existing, profile, conversation_id, session_id):
+            raise PluginError("not_found", "No job with that id in this conversation.")
+        # An omitted deadline is the one already saved. Recomputing now+20m
+        # would make an identical retry look like changed content.
+        if supplied_deadline is None or supplied_deadline == "":
+            deadline_text = existing["deadline"]
+        else:
+            deadline_text = format_utc(_parse_deadline(supplied_deadline, created_at, now))
         # created_at stays the original stamp. The brief column is wiped after
         # registration, so identity is the stored hash, not that column.
         probe = {
@@ -165,12 +173,7 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
             "created_at": existing["created_at"],
             "attempt": 1,
         }
-        same = (
-            existing["profile"] == profile
-            and existing["conversation_id"] == conversation_id
-            and int(existing["hop"]) == int(settings.hop)
-            and identity_hash(probe) == existing["envelope_hash"]
-        )
+        same = int(existing["hop"]) == int(settings.hop) and identity_hash(probe) == existing["envelope_hash"]
         if same:
             logger.info("event=escalate job_id=%s state=%s deduped=true", job_id, existing["state"])
             return {
@@ -180,6 +183,7 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
                 "deduped": True,
             }
         raise PluginError("conflict", "This job_id was already saved with different contents.")
+    deadline_text = format_utc(_parse_deadline(supplied_deadline, created_at, now))
     envelope = {
         "job_id": job_id,
         "from": settings.sender,
@@ -217,10 +221,12 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
             "attempt": 1,
             "envelope_hash": digest,
             "state": state,
-            "expires_at": format_utc(deadline),
+            "expires_at": deadline_text,
         },
         now,
     )
+    if kind in {"duplicate", "conflict"} and not store.shares_origin(row, profile, conversation_id, session_id):
+        raise PluginError("not_found", "No job with that id in this conversation.")
     if kind == "conflict":
         raise PluginError("conflict", "This job_id was already saved with different contents.")
     logger.info("event=escalate job_id=%s state=%s deduped=%s", job_id, row["state"], kind == "duplicate")
@@ -251,13 +257,19 @@ def _result_view(store: Store, job: dict) -> dict | None:
 
 
 def _job_view(store: Store, job: dict, relay_pull: str) -> dict:
+    result = _result_view(store, job)
+    state = job["state"]
+    # Local expiry means we stopped waiting. A result the relay accepted is the
+    # execution outcome, so status does not report expired next to a done body.
+    if result is not None and state == "expired" and result["status"] in RESULT_STATUSES:
+        state = result["status"]
     return {
         "job_id": job["job_id"],
-        "state": job["state"],
+        "state": state,
         "wake_status": job["wake_status"],
         "target": job["target"],
         "execution_location": job["execution_location"],
-        "result": _result_view(store, job),
+        "result": result,
         "relay_pull": relay_pull,
     }
 
@@ -503,6 +515,19 @@ def tick(store: Store, client: RelayClient, settings: Settings, now: datetime, *
     if store.has_active():
         return "active"
     return "idle"
+
+
+def record_compaction(store: Store, profile: str, session_id: str, old_session_id: str, now: datetime | None = None) -> bool:
+    """Remember a rotating compaction Hermes reported via ``post_compaction``.
+
+    ``old_session_id`` is empty when compaction stays on the same session id.
+    A caller-supplied parent id is not recorded here. Only this hook's arguments
+    are, and only when the two ids differ.
+    """
+    now = now or _clock()
+    if not isinstance(session_id, str) or not isinstance(old_session_id, str):
+        return False
+    return store.note_session_lineage(profile, session_id, old_session_id, now)
 
 
 def format_context(rows: list[dict]) -> str:

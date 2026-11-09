@@ -17,6 +17,7 @@ provides_tools:
   - dome_relay_cancel
 provides_hooks:
   - pre_llm_call
+  - post_compaction
 capabilities: []
 config_schema:
   # The Grok routine URL and key are Fly secrets on the relay process only.
@@ -72,14 +73,17 @@ config_schema:
     default: false
     description: >
       When true, pre_llm_call adds newly finished results for this conversation
-      to the current turn. Default false: read results with dome_relay_status.
+      to the current turn. Default false. dome_relay_status is the supported
+      way to read a result.
   inject_message:
     type: bool
     default: false
     description: >
-      When true, the plugin may call ctx.inject_message for a finished result.
-      Gateway delivery also needs plugins.entries.dome-relay.allow_gateway_injection
-      set to true on the host. A refusal is ignored and status still works.
+      Optional and off by default. Not a supported push path. When true, the
+      plugin may call ctx.inject_message only if Hermes passed a gateway
+      session_key. It does not use the transcript session id as that key.
+      Gateway delivery also needs allow_gateway_injection on the host.
+      A refusal is not retried. Read the result with dome_relay_status.
   allow_loopback:
     type: bool
     default: false
