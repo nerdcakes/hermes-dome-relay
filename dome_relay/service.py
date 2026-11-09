@@ -144,13 +144,21 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
         raise PluginError("invalid_config", "hop must be 0 or 1.")
     origin = _origin(settings)
     created_at = now.replace(microsecond=0)
-    deadline = _parse_deadline(args.get("deadline"), created_at, now)
     artifacts = _artifacts(args.get("artifacts"))
-    deadline_text = format_utc(deadline)
     created_text = format_utc(created_at)
     artifacts_json = json.dumps(artifacts, sort_keys=True)
+    supplied_deadline = args.get("deadline")
     existing = store.get(job_id) if supplied else None
     if existing is not None:
+        # Another session in this profile must not learn that the id exists.
+        if not store.shares_origin(existing, profile, conversation_id, session_id):
+            raise PluginError("not_found", "No job with that id in this conversation.")
+        # An omitted deadline is the one already saved. Recomputing now+20m
+        # would make an identical retry look like changed content.
+        if supplied_deadline is None or supplied_deadline == "":
+            deadline_text = existing["deadline"]
+        else:
+            deadline_text = format_utc(_parse_deadline(supplied_deadline, created_at, now))
         # created_at stays the original stamp. The brief column is wiped after
         # registration, so identity is the stored hash, not that column.
         probe = {
@@ -165,12 +173,7 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
             "created_at": existing["created_at"],
             "attempt": 1,
         }
-        same = (
-            existing["profile"] == profile
-            and existing["conversation_id"] == conversation_id
-            and int(existing["hop"]) == int(settings.hop)
-            and identity_hash(probe) == existing["envelope_hash"]
-        )
+        same = int(existing["hop"]) == int(settings.hop) and identity_hash(probe) == existing["envelope_hash"]
         if same:
             logger.info("event=escalate job_id=%s state=%s deduped=true", job_id, existing["state"])
             return {
@@ -180,6 +183,7 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
                 "deduped": True,
             }
         raise PluginError("conflict", "This job_id was already saved with different contents.")
+    deadline_text = format_utc(_parse_deadline(supplied_deadline, created_at, now))
     envelope = {
         "job_id": job_id,
         "from": settings.sender,
@@ -217,10 +221,12 @@ def escalate(store: Store, settings: Settings, args: dict, *, profile: str, conv
             "attempt": 1,
             "envelope_hash": digest,
             "state": state,
-            "expires_at": format_utc(deadline),
+            "expires_at": deadline_text,
         },
         now,
     )
+    if kind in {"duplicate", "conflict"} and not store.shares_origin(row, profile, conversation_id, session_id):
+        raise PluginError("not_found", "No job with that id in this conversation.")
     if kind == "conflict":
         raise PluginError("conflict", "This job_id was already saved with different contents.")
     logger.info("event=escalate job_id=%s state=%s deduped=%s", job_id, row["state"], kind == "duplicate")
@@ -251,13 +257,20 @@ def _result_view(store: Store, job: dict) -> dict | None:
 
 
 def _job_view(store: Store, job: dict, relay_pull: str) -> dict:
+    result = _result_view(store, job)
+    state = job["state"]
+    # A terminal result accepted before the deadline still reads done or failed
+    # when it is retrieved late. held stays in the result body; the job state
+    # stays expired so the target slot is not reserved.
+    if result is not None and state == "expired" and result["status"] in {"done", "failed"}:
+        state = result["status"]
     return {
         "job_id": job["job_id"],
-        "state": job["state"],
+        "state": state,
         "wake_status": job["wake_status"],
         "target": job["target"],
         "execution_location": job["execution_location"],
-        "result": _result_view(store, job),
+        "result": result,
         "relay_pull": relay_pull,
     }
 
@@ -505,6 +518,19 @@ def tick(store: Store, client: RelayClient, settings: Settings, now: datetime, *
     return "idle"
 
 
+def record_compaction(store: Store, profile: str, session_id: str, old_session_id: str, now: datetime | None = None) -> bool:
+    """Remember a rotating compaction Hermes reported via ``post_compaction``.
+
+    ``old_session_id`` is empty when compaction stays on the same session id.
+    A caller-supplied parent id is not recorded here. Only this hook's arguments
+    are, and only when the two ids differ.
+    """
+    now = now or _clock()
+    if not isinstance(session_id, str) or not isinstance(old_session_id, str):
+        return False
+    return store.note_session_lineage(profile, session_id, old_session_id, now)
+
+
 def format_context(rows: list[dict]) -> str:
     lines = [
         "Dome Relay results for this conversation.",
@@ -522,9 +548,9 @@ def format_context(rows: list[dict]) -> str:
 def inject_ready_results(store: Store, settings: Settings, ctx, *, profile: str, conversation_id: str, session_id: str = "", session_key: str | None = None, now: datetime | None = None):
     """Optional pre_llm_call injection. Off unless a setting says otherwise.
 
-    ``ctx.inject_message`` runs only when ``inject_message`` is true. A False
-    return (gateway injection not granted, or no live session) is ignored.
-    The saved result stays available through dome_relay_status.
+    ``ctx.inject_message`` runs only when ``inject_message`` is true and Hermes
+    supplied a gateway routing key. A missing key does not call it. A False
+    return is ignored. The saved result stays available through dome_relay_status.
     """
     now = now or _clock()
     if not settings.inject_context and not settings.inject_message:
@@ -535,20 +561,21 @@ def inject_ready_results(store: Store, settings: Settings, ctx, *, profile: str,
     if not rows:
         return None
     text = format_context(rows)
-    pushed = False
-    if settings.inject_message:
+    attempted_push = False
+    # No routing key means no inject_message call. Status retrieval is the path.
+    if settings.inject_message and session_key:
+        attempted_push = True
         try:
-            kwargs = {}
-            if session_key:
-                kwargs["session_key"] = session_key
-            pushed = bool(ctx.inject_message(text, **kwargs))
+            pushed = bool(ctx.inject_message(text, session_key=session_key))
         except Exception:
             logger.info("event=inject_message_failed")
             pushed = False
         if not pushed:
             logger.info("event=inject_message_declined")
-    # One announcement. Status still returns the result after this.
-    store.mark_announced([row["cursor"] for row in rows], now)
+    if settings.inject_context or attempted_push:
+        # One announcement after a context note or a push attempt.
+        # Status still returns the result after this.
+        store.mark_announced([row["cursor"] for row in rows], now)
     if settings.inject_context:
         return {"context": text}
     return None

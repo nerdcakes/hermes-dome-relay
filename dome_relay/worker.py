@@ -7,6 +7,10 @@ the lease. Ctrl-C releases the lease and returns.
 
 Local-only jobs stay held until this process has refreshed the heartbeat
 inside the configured window (60 seconds unless settings say otherwise).
+
+Hermes ``plugins.isolation: host`` skips ``ctx.register_cli_command``. That
+call is the only worker entrypoint, so the supported deployment is in-process.
+This constant does not change Hermes terminal or Docker sandboxing.
 """
 
 from __future__ import annotations
@@ -21,6 +25,9 @@ from .config import LEASE_SECONDS, UNREACHABLE_BACKOFF_CAP_SECONDS, load_setting
 from .service import tick
 from .storage import open_store
 
+
+# See the module docstring. In-process is the only mode that registers the worker.
+SUPPORTED_ISOLATION = "in_process"
 
 logger = logging.getLogger("dome_relay.plugin")
 

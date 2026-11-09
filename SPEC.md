@@ -1,6 +1,6 @@
 # Dome Relay technical specification
 
-**Status:** the relay in `relay/` is implemented and is the contract below. The Hermes plugin and local worker are still a design and are not implemented. Author: Juni, interim CTO. Relay rules below were aligned to the built service.
+**Status:** the relay in `relay/` and the Hermes plugin and local worker in `dome_relay/` are implemented. Target Hermes release: v0.23.0 (`requires_hermes: ">=0.23.0"`). Author: Juni, interim CTO. Relay rules below are the built service. One Hermes limit is called out in section 3A: v0.23.0 does not pass a compression-stable `conversation_id` to plugin tools.
 **Target:** one real round trip before the November 11, 2026 noon HST contest deadline.
 
 ## 1. Goal and scope
@@ -13,7 +13,7 @@ A real external executive and sanctioned callback mechanism must be proven. A mo
 
 ## 2. Current repository and exact Hermes integration contract
 
-Read before changing the plugin: README.md, plugin.yaml, dome_relay/__init__.py, .gitignore, and `relay/` on main. The relay service runs. The plugin still only builds a partial brief; send_brief raises NotImplementedError. No runnable plugin is claimed. The manifest must not declare the Grok webhook URL or the Grok key.
+Read before changing the plugin: README.md, plugin.yaml, the root `__init__.py`, and `relay/` on main. The relay service, the three tools, and the local worker all run. The manifest must not declare the Grok webhook URL or the Grok key.
 
 ### Layout and entrypoint
 
@@ -42,7 +42,7 @@ tests/
 scripts/e2e.py
 ```
 
-The manifest and loadable root `__init__.py` must be adjacent. `entrypoint: dome_relay` is not the documented native loader mechanism; remove it. Replace placeholder `config:` with `config_schema:`. A manifest-only correction does NOT repair the currently absent root entrypoint.
+The manifest and loadable root `__init__.py` are adjacent. `register(ctx)` lives in that root file. The manifest uses `config_schema:` and does not set `entrypoint:`.
 
 In root `register(ctx)`, register exactly `dome_relay_escalate`, `dome_relay_status`, `dome_relay_cancel` using `ctx.register_tool(name=..., toolset="dome_relay", schema=..., handler=...)`. Each schema has name, description and a JSON Schema parameters object. Handlers accept `(args: dict, **kwargs) -> str`, catch errors and return JSON strings, including errors. Do not shadow existing tools. `register()` must perform no network calls or launch workers; doctor imports it in isolation.
 
@@ -50,7 +50,7 @@ In root `register(ctx)`, register exactly `dome_relay_escalate`, `dome_relay_sta
 - status: job_id; query the originating profile/conversation's job and latest result, never another user's job. This is the minimum durable return-to-origin mechanism.
 - cancel: job_id; stop retries and future result injection. Cancellation after acceptance is local/best-effort; it cannot undo external work or reliably interrupt a running Grok Bot routine.
 
-Manifest v2 uses top-level `provides_tools`, `provides_hooks`, `config_schema`, `requires_env`, `python_dependencies` and a LIST of privileged `capabilities`. Do not confuse this with a future catalog YAML's `capabilities` MAPPING, which summarizes actual tools/hooks/middleware/env names. Declare only implemented registrations. A design commit should retain `provides_tools: []` until tools actually register.
+Manifest v2 uses top-level `provides_tools`, `provides_hooks`, `config_schema`, `requires_env`, `python_dependencies` and a LIST of privileged `capabilities`. Do not confuse this with a future catalog YAML's `capabilities` MAPPING, which summarizes actual tools/hooks/middleware/env names. Declare only implemented registrations. `provides_tools` lists the three tools. `provides_hooks` lists `pre_llm_call` and `post_compaction`.
 
 Use `ctx.get_config("relay_url", default="")` for nonsecret plugin settings, resolved under `plugins.entries.dome-relay.settings`; `ctx.set_config` changes only that namespace. The only plugin secret is `DOME_RELAY_KEY`, read through `from agent.secret_scope import get_secret`, then `get_secret("DOME_RELAY_KEY")`. The plugin must never read `DOME_RELAY_GROK_KEY`, `DOME_RELAY_GROK_WEBHOOK_URL`, or `DOME_RELAY_CALLBACK_KEY`. Those live only as Fly secrets on the relay process. Never read `.env`, auth.json, browser profiles or a bare process-wide environment for Hermes secrets. Resolve the active profile's values before passing narrowly scoped credentials to a worker; do not reuse one global client across profiles.
 
@@ -62,11 +62,15 @@ Do not invent a minimum Hermes version: pin a released test version and derive t
 
 ### A. Plugin and worker
 
-SQLite tables: jobs, attempts, audit_events, result_inbox, consumer_cursors and delivery_outbox. Jobs retain profile, original conversation_id, session-routing metadata, immutable envelope hash, local execution requirement, timestamps, lease and terminal state. Use conversation_id rather than session_id alone because compression may rotate transcript segments.
+SQLite tables: jobs, attempts, audit_events, result_inbox, consumer_cursors, delivery_outbox, and session_lineage. Jobs retain profile, original conversation_id, session-routing metadata, immutable envelope hash, local execution requirement, timestamps, lease and terminal state.
+
+Hermes v0.23.0 tool calls receive the physical `session_id` and do not receive a compression-stable `conversation_id`. That argument was added to Hermes after the v0.23.0 tag (plugin tools and tool hooks only; this plugin does not patch Hermes). Rotating compression (`compression.in_place: false`) therefore changes the id a later tool call sees. The plugin records a lineage edge only when the public `post_compaction` hook reports a new `session_id` and a different `old_session_id`. Status, cancel, a repeated escalate, and optional result injection follow that chain inside the same profile. A `parent_session_id` on `pre_llm_call` is not ownership: in v0.23.0 it is the delegating agent, not the compression parent, and treating it as proof would admit a different session. In-place compression keeps the session id, so no edge is required. If `post_compaction` did not run in this profile, a later call that only has the new session id is `not_found`. The plugin does not read Hermes session tables. When a future Hermes passes `conversation_id`, that id is the stable key: two non-empty conversation ids must match, and a different conversation id does not inherit the session.
 
 The worker runs network I/O without model-token polling. A configured interval checks pending work and pulls relay results; default 15 seconds while active, with backoff when idle or unreachable. This is process polling, not a recurring executive routine. Persist cursor and inbox entries atomically before applying results.
 
-The MVP returns results through status retrieval in the origin conversation until reinjection is proven on the pinned Hermes build. `ctx.inject_message` is UNVERIFIED in the Hermes plugin guide; do not build against it as an established API. The documented surface is `pre_llm_call` hook injection, which is ephemeral and applies to the current turn only, not persisted delivery to the origin session. Any future automatic reinjection must first prove correct active-profile context and session recovery on the pinned build; if the origin session no longer exists, retain the result for status retrieval instead of injecting into a random new session. Any proven automatic delivery remains at-least-once with a stable result ID, not guaranteed exactly once across a crash at the host boundary.
+The supported return path is status retrieval in the origin conversation. `inject_context` and `inject_message` default to false. Optional `ctx.inject_message` is not a supported push path: a gateway routing key is not the transcript session id, and this plugin does not invent one. `pre_llm_call` context, when enabled, is ephemeral and applies to the current turn only. It is limited to the same origin check as status. A result that cannot be matched to this conversation stays available through status. Optional delivery is at-least-once when it runs, not exactly once across a crash at the host boundary.
+
+Local expiry and a terminal relay result are different. `expired` means this profile stopped waiting and the job no longer reserves its target. A `done` or `failed` result the relay accepted before the deadline still becomes the job state when it is retrieved late. A `held` result stays stored for inspection, and after the deadline the operational state is `expired` so a later job for that target can be sent. A canceled job does not return a result. A stored result is not a new turn in the originating task and does not apply the result as code.
 
 ### B. Plugin dispatch
 
@@ -198,13 +202,13 @@ The relay in section 3C is already implemented. The plugin must follow that cont
 
 ## 9. Open questions / gates
 
-1. Which released Hermes version is the test baseline, and what is the minimum supported SemVer after validation?
+1. The pinned test baseline is Hermes v0.23.0 (`requires_hermes: ">=0.23.0"`). `hermes plugins doctor <plugin-dir> --ci` and `hermes plugins validate <plugin-dir>` on that release are still an operator check. This repo's pytest suite does not run them, and they must not be reported as passed until someone executes them.
 2. The implemented host recipe is one always-on Fly machine with a SQLite volume (`relay/fly.toml`: `auto_stop_machines = "off"`, `min_machines_running = 1`). Who owns the Fly account, and who accepts the idle-machine cost, is still open. Relay retention itself is question 9.
 3. Can the actual Grok Bot routine call claim and complete through a sanctioned authenticated HTTP/MCP interface? Prove this before feature expansion.
 4. What exact standing tasks/targets does N authorize, including executive usage ceilings and escalation priority policy?
 5. **Open: per-target callback keys.** The built relay has one `DOME_RELAY_CALLBACK_KEY` for every target. It is different from `DOME_RELAY_KEY` and from `DOME_RELAY_GROK_KEY`. A separate key per target, and who rotates keys, are not decided.
-6. The MVP uses status retrieval in the origin conversation. Can automatic reinjection be proven on the pinned Hermes build after session rotation/restart? `ctx.inject_message` is UNVERIFIED; documented `pre_llm_call` injection is ephemeral and current-turn only, not persisted origin-session delivery.
-7. **Resolved.** One outstanding accepted or held job per target, three wake attempts (5s then 15s plus up to 1s of jitter), one hop (`hop` 0 or 1, no parent), and expiry 30 minutes from server receive time. A local-worker heartbeat threshold is still open because the plugin worker is not built.
+6. **Partly bounded.** Status retrieval in the origin conversation is the supported return path. v0.23.0 does not pass a compression-stable `conversation_id` (section 3A). Optional `inject_message` stays off and is not a supported push path. A stored result does not resume the originating task or apply the result as code.
+7. **Resolved.** One outstanding accepted or held job per target, three wake attempts (5s then 15s plus up to 1s of jitter), one hop (`hop` 0 or 1, no parent), and expiry 30 minutes from server receive time. The local-worker heartbeat window is 60 seconds (`local_heartbeat_seconds`) unless that setting is changed. The spec left the number open; the plugin chose 60.
 8. **Resolved.** Do not auto-reclaim a crashed executive claim. The claim stands until `POST /jobs/{job_id}/cancel` or the 30 minute expiry.
 9. **Relay retention is resolved. A purge tool is still open.** The relay deletes stored task text when the wake attempt finishes. Results remain in the volume SQLite file until an operator deletes that file. There is no purge or deletion API. Who may inspect stored results, and what retention applies to the plugin's own database, are still open.
 10. Publication approval: confirm exact main-branch spec/manifest edits and use of a public repository; no upstream PR or demo post is included here.

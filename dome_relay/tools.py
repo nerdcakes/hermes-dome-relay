@@ -10,7 +10,7 @@ from .errors import PluginError
 from .schemas import CANCEL, ESCALATE, STATUS
 from .service import cancel as cancel_job
 from .service import escalate as escalate_job
-from .service import inject_ready_results, status as status_job
+from .service import inject_ready_results, record_compaction, status as status_job
 from .storage import open_store
 
 
@@ -128,8 +128,15 @@ def build_handlers(ctx):
             if not settings.inject_context and not settings.inject_message:
                 return None
             origin_session = session_id if isinstance(session_id, str) else ""
-            conversation_id = _text(kwargs, "conversation_id") or origin_session
-            session_key = _text(kwargs, "session_key") or origin_session
+            # Do not copy the physical session id into conversation_id. Hermes
+            # v0.23.0 does not pass a stable conversation id, and a replacement
+            # session is recognized only through a recorded compaction edge.
+            # parent_session_id on this hook is the delegating agent, not proof
+            # that this session continues the stored one.
+            conversation_id = _text(kwargs, "conversation_id")
+            # A gateway routing key is not the transcript session id. Optional
+            # push stays unsupported; status retrieval is the path that works.
+            session_key = _text(kwargs, "session_key")
             store = open_store()
             try:
                 return inject_ready_results(
@@ -147,11 +154,29 @@ def build_handlers(ctx):
             logger.info("event=pre_llm_call_skipped")
             return None
 
+    def post_compaction(session_id=None, old_session_id=None, **kwargs):
+        """Record a rotating compaction. In-place compaction has an empty old id."""
+        try:
+            store = open_store()
+            try:
+                record_compaction(
+                    store,
+                    _profile(ctx),
+                    session_id if isinstance(session_id, str) else "",
+                    old_session_id if isinstance(old_session_id, str) else "",
+                )
+            finally:
+                store.close()
+        except Exception:
+            logger.info("event=post_compaction_skipped")
+        return None
+
     return {
         "dome_relay_escalate": dome_relay_escalate,
         "dome_relay_status": dome_relay_status,
         "dome_relay_cancel": dome_relay_cancel,
         "pre_llm_call": pre_llm_call,
+        "post_compaction": post_compaction,
     }
 
 
@@ -177,6 +202,7 @@ def register_tools(ctx) -> None:
         handler=handlers["dome_relay_cancel"],
     )
     ctx.register_hook("pre_llm_call", handlers["pre_llm_call"])
+    ctx.register_hook("post_compaction", handlers["post_compaction"])
     from .worker import handle_cli, setup_cli
 
     ctx.register_cli_command(
