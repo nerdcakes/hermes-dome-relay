@@ -200,6 +200,54 @@ def test_pre_llm_call_is_off_until_configured_and_inject_false_degrades(monkeypa
     opened.close()
 
 
+def test_inject_message_is_not_called_without_a_routing_key(monkeypatch, tmp_path):
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from dome_relay.service import escalate
+    from dome_relay.storage import Store
+
+    conn = sqlite3.connect(tmp_path / "no-key.db")
+    opened = Store(conn)
+    opened.close = lambda: None
+    now = datetime(2026, 11, 7, 21, 0, tzinfo=timezone.utc)
+    saved = escalate(
+        opened,
+        make_settings(),
+        job_args(),
+        profile="default",
+        conversation_id="conv-1",
+        session_id="sess-1",
+        now=now,
+    )
+    opened.apply_result_batch(
+        [
+            {
+                "cursor": "c1",
+                "result": {
+                    "job_id": saved["job_id"],
+                    "status": "done",
+                    "result": "finished",
+                    "completed_at": "2026-11-07T21:05:00Z",
+                    "body_hash": "abc",
+                },
+            }
+        ],
+        "c1",
+        now,
+    )
+    monkeypatch.setattr("dome_relay.tools.open_store", lambda: opened)
+    monkeypatch.setattr(
+        "dome_relay.tools.load_settings_from_context",
+        lambda _ctx: make_settings(inject_context=False, inject_message=True),
+    )
+    ctx = FakeCtx(inject_ok=True)
+    handlers = build_handlers(ctx)
+    assert handlers["pre_llm_call"](session_id="sess-1", conversation_id="conv-1") is None
+    assert ctx.injected == []
+    opened.close()
+
+
 def test_parent_session_id_does_not_grant_injection_and_lineage_does(monkeypatch, tmp_path):
     import sqlite3
     from datetime import datetime, timezone

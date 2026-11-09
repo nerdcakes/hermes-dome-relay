@@ -70,7 +70,7 @@ The worker runs network I/O without model-token polling. A configured interval c
 
 The supported return path is status retrieval in the origin conversation. `inject_context` and `inject_message` default to false. Optional `ctx.inject_message` is not a supported push path: a gateway routing key is not the transcript session id, and this plugin does not invent one. `pre_llm_call` context, when enabled, is ephemeral and applies to the current turn only. It is limited to the same origin check as status. A result that cannot be matched to this conversation stays available through status. Optional delivery is at-least-once when it runs, not exactly once across a crash at the host boundary.
 
-Local expiry and the relay result are different. `expired` means this profile stopped waiting and has no stored result. A result the relay accepted is the execution outcome (`done`, `held`, or `failed`) even if the local deadline has passed by the time it is retrieved. A canceled job does not return that result. A stored result is not a new turn in the originating task and does not apply the result as code.
+Local expiry and a terminal relay result are different. `expired` means this profile stopped waiting and the job no longer reserves its target. A `done` or `failed` result the relay accepted before the deadline still becomes the job state when it is retrieved late. A `held` result stays stored for inspection, and after the deadline the operational state is `expired` so a later job for that target can be sent. A canceled job does not return a result. A stored result is not a new turn in the originating task and does not apply the result as code.
 
 ### B. Plugin dispatch
 

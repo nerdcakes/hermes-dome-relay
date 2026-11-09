@@ -394,6 +394,109 @@ def test_late_pull_reports_the_relay_result_not_local_expiry(store, clock):
     assert store.get(saved["job_id"])["state"] == "done"
 
 
+def _result_page(job_id: str, status_word: str, text: str, cursor: str) -> dict:
+    return {
+        "results": [
+            {
+                "cursor": cursor,
+                "result": {
+                    "job_id": job_id,
+                    "status": status_word,
+                    "result": text,
+                    "completed_at": "2026-11-07T21:05:00Z",
+                },
+            }
+        ],
+        "next_cursor": cursor,
+    }
+
+
+def test_expired_held_result_releases_the_target_slot(store, clock):
+    """A held callback stays readable, and after the deadline it must not block the target.
+
+    Covers a result saved before expiry and one first retrieved after expiry.
+    A later done result retrieved late still reads done.
+    """
+    settings = make_settings()
+    deadline = format_utc(clock.now + timedelta(minutes=10))
+    later = format_utc(clock.now + timedelta(minutes=25))
+    first = save(store, clock, settings, target="research", deadline=deadline)
+    relay, _transport = client_for(settings, [accepted(first["job_id"])], clock)
+    dispatch_queued(store, relay, settings, clock.now)
+    held_pull, _transport = client_for(
+        settings,
+        [httpx.Response(200, json=_result_page(first["job_id"], "held", "waiting on review", "c1"))],
+        clock,
+    )
+    assert pull_into(store, held_pull, clock.now, max_attempts=1) == "ok"
+    assert store.get(first["job_id"])["state"] == "held"
+    second = save(store, clock, settings, target="research", deadline=later)
+    blocked, transport = client_for(settings, [accepted(second["job_id"])], clock)
+    dispatch_queued(store, blocked, settings, clock.now)
+    assert transport.calls == []
+    assert store.get(second["job_id"])["state"] == "queued"
+
+    clock.advance(minutes=11)
+    viewed = status(
+        store,
+        settings,
+        first["job_id"],
+        profile=PROFILE,
+        conversation_id=CONVERSATION,
+        session_id="sess-1",
+        now=clock.now,
+    )
+    assert viewed["result"]["status"] == "held"
+    assert viewed["result"]["result"] == "waiting on review"
+    assert store.get(first["job_id"])["state"] == "expired"
+    assert store.target_busy("research") is False
+    released, transport = client_for(settings, [accepted(second["job_id"])], clock)
+    dispatch_queued(store, released, settings, clock.now)
+    assert [json.loads(call.content)["envelope"]["job_id"] for call in transport.calls] == [second["job_id"]]
+    assert store.get(second["job_id"])["state"] == "accepted"
+    # A later status must not put the expired held job back on the slot.
+    status(
+        store,
+        settings,
+        first["job_id"],
+        profile=PROFILE,
+        conversation_id=CONVERSATION,
+        session_id="sess-1",
+        now=clock.now,
+    )
+    assert store.get(first["job_id"])["state"] == "expired"
+    assert store.target_busy("research") is True
+
+    clock.advance(minutes=-11)
+    late = save(store, clock, settings, target="late-held", deadline=format_utc(clock.now + timedelta(minutes=10)))
+    registered, _transport = client_for(settings, [accepted(late["job_id"])], clock)
+    dispatch_queued(store, registered, settings, clock.now)
+    clock.advance(minutes=11)
+    late_view = status(
+        store,
+        settings,
+        late["job_id"],
+        profile=PROFILE,
+        conversation_id=CONVERSATION,
+        session_id="sess-1",
+        now=clock.now,
+        client=client_for(
+            settings,
+            [httpx.Response(200, json=_result_page(late["job_id"], "held", "retrieved after the deadline", "c2"))],
+            clock,
+        )[0],
+    )
+    assert late_view["result"]["status"] == "held"
+    assert late_view["result"]["result"] == "retrieved after the deadline"
+    assert store.get(late["job_id"])["state"] == "expired"
+    assert store.target_busy("late-held") is False
+    follow = save(store, clock, settings, target="late-held", deadline=format_utc(clock.now + timedelta(minutes=10)))
+    sent, transport = client_for(settings, [accepted(follow["job_id"])], clock)
+    dispatch_queued(store, sent, settings, clock.now)
+    assert [json.loads(call.content)["envelope"]["job_id"] for call in transport.calls] == [follow["job_id"]]
+    assert store.get(follow["job_id"])["state"] == "accepted"
+
+
 def test_worker_registers_with_bearer_callback_and_hash(store, clock):
     settings = make_settings()
     saved = save(store, clock, settings)

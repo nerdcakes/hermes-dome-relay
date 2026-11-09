@@ -25,7 +25,8 @@ _LINEAGE_HOPS = 32
 SLOT_STATES = ("registered", "dispatching", "retry_wait", "accepted", "held", "uncertain")
 ACTIVE_STATES = SLOT_STATES + ("queued", "held_local")
 TERMINAL_STATES = ("done", "failed", "canceled", "expired", "rejected")
-EXECUTION_RESULTS = ("done", "held", "failed")
+# done and failed do not occupy a target slot. held does, until the deadline.
+TERMINAL_RESULTS = ("done", "failed")
 
 
 def _now() -> datetime:
@@ -497,8 +498,8 @@ class Store:
                 if not waiting_over:
                     continue
                 outcome = self._latest_result_status_locked(job["job_id"])
-                if outcome in EXECUTION_RESULTS:
-                    # Local waiting can lapse after the relay already accepted a result.
+                if outcome in TERMINAL_RESULTS:
+                    # A done or failed result does not reserve the target.
                     if job["state"] != outcome:
                         self._conn.execute(
                             "UPDATE jobs SET state = ?, brief = '', updated_at = ? WHERE job_id = ?",
@@ -506,6 +507,8 @@ class Store:
                         )
                         self._audit("execution_result", job["job_id"], {"status": outcome}, stamp)
                     continue
+                # held is interim. After the deadline the result stays in the inbox
+                # and the operational state is expired, so the target slot is free.
                 if job["state"] == "expired":
                     continue
                 self._conn.execute(
@@ -740,9 +743,13 @@ class Store:
                 )
                 stored += 1
                 if job["state"] not in ("canceled", "done", "failed"):
+                    next_state = result["status"]
+                    # A held update retrieved after the deadline must not take the slot.
+                    if next_state == "held" and (job["state"] == "expired" or self._is_expired(job, now)):
+                        next_state = "expired"
                     self._conn.execute(
                         "UPDATE jobs SET state = ?, brief = '', updated_at = ? WHERE job_id = ?",
-                        (result["status"], stamp, result["job_id"]),
+                        (next_state, stamp, result["job_id"]),
                     )
                 delivery_state = "delivery_pending"
                 if job["state"] == "canceled":

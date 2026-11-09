@@ -259,9 +259,10 @@ def _result_view(store: Store, job: dict) -> dict | None:
 def _job_view(store: Store, job: dict, relay_pull: str) -> dict:
     result = _result_view(store, job)
     state = job["state"]
-    # Local expiry means we stopped waiting. A result the relay accepted is the
-    # execution outcome, so status does not report expired next to a done body.
-    if result is not None and state == "expired" and result["status"] in RESULT_STATUSES:
+    # A terminal result accepted before the deadline still reads done or failed
+    # when it is retrieved late. held stays in the result body; the job state
+    # stays expired so the target slot is not reserved.
+    if result is not None and state == "expired" and result["status"] in {"done", "failed"}:
         state = result["status"]
     return {
         "job_id": job["job_id"],
@@ -547,9 +548,9 @@ def format_context(rows: list[dict]) -> str:
 def inject_ready_results(store: Store, settings: Settings, ctx, *, profile: str, conversation_id: str, session_id: str = "", session_key: str | None = None, now: datetime | None = None):
     """Optional pre_llm_call injection. Off unless a setting says otherwise.
 
-    ``ctx.inject_message`` runs only when ``inject_message`` is true. A False
-    return (gateway injection not granted, or no live session) is ignored.
-    The saved result stays available through dome_relay_status.
+    ``ctx.inject_message`` runs only when ``inject_message`` is true and Hermes
+    supplied a gateway routing key. A missing key does not call it. A False
+    return is ignored. The saved result stays available through dome_relay_status.
     """
     now = now or _clock()
     if not settings.inject_context and not settings.inject_message:
@@ -560,20 +561,21 @@ def inject_ready_results(store: Store, settings: Settings, ctx, *, profile: str,
     if not rows:
         return None
     text = format_context(rows)
-    pushed = False
-    if settings.inject_message:
+    attempted_push = False
+    # No routing key means no inject_message call. Status retrieval is the path.
+    if settings.inject_message and session_key:
+        attempted_push = True
         try:
-            kwargs = {}
-            if session_key:
-                kwargs["session_key"] = session_key
-            pushed = bool(ctx.inject_message(text, **kwargs))
+            pushed = bool(ctx.inject_message(text, session_key=session_key))
         except Exception:
             logger.info("event=inject_message_failed")
             pushed = False
         if not pushed:
             logger.info("event=inject_message_declined")
-    # One announcement. Status still returns the result after this.
-    store.mark_announced([row["cursor"] for row in rows], now)
+    if settings.inject_context or attempted_push:
+        # One announcement after a context note or a push attempt.
+        # Status still returns the result after this.
+        store.mark_announced([row["cursor"] for row in rows], now)
     if settings.inject_context:
         return {"context": text}
     return None

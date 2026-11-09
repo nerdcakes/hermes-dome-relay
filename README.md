@@ -117,7 +117,7 @@ The worker command exists only when this plugin loads in-process. That is the He
 
 Status reads the job that belongs to this conversation. Hermes v0.23.0 passes the physical `session_id` and does not pass a conversation id that stays put when rotating compression (`compression.in_place: false`) replaces that id. The public stable `conversation_id` was added to Hermes after v0.23.0, so this plugin does not call Hermes session internals to walk the lineage. It records an edge only from the `post_compaction` hook, when Hermes reports a new session id and a different previous id. A later status, cancel, or repeat escalate from that replacement session can see the same job. A different session in the same profile cannot. In-place compression (the Hermes default) keeps the session id, so no edge is required. If the hook did not run, a call that only has the new session id is `not_found`.
 
-`expired` on status means the plugin stopped waiting and no relay result was stored. If the relay accepted a result and this profile has stored it, status reports that result (`done`, `held`, or `failed`) even when the local deadline has already passed. A canceled job still does not return a result.
+`expired` means this profile stopped waiting, and the job no longer reserves its target. A terminal relay result (`done` or `failed`) that was accepted before the deadline still replaces that state when it is retrieved late. A `held` result stays in the status body so it can be read, and after the deadline the job state is `expired` so the next job for that target can be sent. A canceled job still does not return a result.
 
 ### What you can turn on later
 
