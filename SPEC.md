@@ -110,7 +110,7 @@ Endpoints:
 These are separate observations. Do not treat one as proof of another, and do not treat a receiver's local status word as a relay state.
 
 - **Registration.** The plugin worker calls `POST /jobs`. A 201 means the relay stored the job and attempted the wake. A 200 means the same job was already registered. This is not a claim and not a result.
-- **Wake acceptance.** The relay's webhook call returned HTTP 200, and `wake_status` is `accepted`. A routine run started. It is not a result, and it is not a claim. After a successful wake the relay job `state` stays `registered` until the executive claims it. The plugin records wake acceptance as plugin `state=accepted` together with `wake_status=accepted`. That plugin `state` value is not evidence of a claim.
+- **Wake acceptance.** The relay's webhook call returned HTTP 200, and `wake_status` is `accepted`. A routine run started. It is not a result, and it is not a claim. After a successful wake, the relay job `state` stays `registered` while the job is still unclaimed, unless it has already advanced or terminated (`finish_wake()` leaves a state that already moved forward, for example if the executive claims before the wake request finishes). The plugin records wake acceptance as plugin `state=accepted` together with `wake_status=accepted`. That plugin `state` value is not evidence of a claim. Wake acceptance alone does not prove a claim.
 - **Routine-local status.** Whatever the receiving routine reports about its own run is local to that routine. It is not a relay state and must not be recorded as one.
 - **Executive claim.** `POST /jobs/{job_id}/claim` succeeds with the callback key. The relay then sets its job `state` to `accepted` and returns `"status": "claimed"`. Only a claimed job may store a result.
 - **Relay result state.** `POST /jobs/{job_id}/complete` stores a `done`, `held`, or `failed` result on the relay. That stored record is the relay's result state. It is not a host notification and it does not resume the originating task or the executive routine.
@@ -169,7 +169,7 @@ The envelope `brief` limit (1 to 16,000) and the result `result` limit (at most 
 
 ## 5. Reliability and local hold
 
-States: queued -> registered -> dispatching -> accepted -> done/failed. Side states: held_local, retry_wait, uncertain, canceled, expired. Keep delivery_pending/delivered separate from execution state. On the relay, `accepted` is the post-claim state; a successful wake leaves the relay job `registered` with `wake_status=accepted`. The plugin records that wake as plugin `state=accepted`. See section 3D.
+States: queued -> registered -> dispatching -> accepted -> done/failed. Side states: held_local, retry_wait, uncertain, canceled, expired. Keep delivery_pending/delivered separate from execution state. On the relay, `accepted` is the post-claim state; a successful wake leaves the relay job `registered` with `wake_status=accepted` while it is still unclaimed, unless the job has already advanced or terminated. The plugin records that wake as plugin `state=accepted`. Wake acceptance is not proof of a claim. See section 3D.
 
 - Insert job_id under a UNIQUE constraint before side effects. Repeating identical escalate returns the existing handle; ID reuse with changed content is an error.
 - The relay retries the Grok wake up to three total attempts. After a transient failure, wait 5 seconds, then 15 seconds, plus a random extra of up to 1 second. A `Retry-After` header replaces that base wait and is still not honored if the wait would pass the job deadline. Retry connect failures and HTTP 408, 429, 500, 502, 503, and 504 only. Never retry 401 or 403. Do not follow redirects. A read or write timeout is uncertain and is not retried. The plugin may retry its own registration and result pull against the relay with the same 3-attempt schedule, and must never turn that retry into a second wake.
@@ -232,7 +232,7 @@ Known open items, called out so they are not treated as decided:
 - Per-target callback keys. Today every target shares one `DOME_RELAY_CALLBACK_KEY`.
 - A purge tool. Nothing in the relay deletes stored results except deleting the SQLite file by hand.
 
-At this revision, the following are not demonstrated or not established: unattended completion; live worker-restart integrity of an in-flight job; end-to-end capture of the wake request body; how much of an accepted brief a receiving model sees.
+At this revision: earlier acknowledgement and short-text round trips completed without a human ferrying the result; what is not demonstrated is unattended completion of a dense, multi-step task end to end without owner intervention. Also not demonstrated or not established: live worker-restart integrity of an in-flight job; end-to-end capture of the wake request body; how much of an accepted brief a receiving model sees.
 
 ## 10. Receiving-side runbook requirements (not implemented in this repository)
 
@@ -242,6 +242,7 @@ The two rules in this section apply to receivers and their runbooks. They are no
 
 An execution handoff — from a receiving routine or parent to the process that will claim and work the job — must preserve:
 
+- the actual received task or brief, including its constraints, verbatim or through an accessible artifact; identify missing portions rather than reconstructing them
 - task identity (`job_id` and target)
 - exact references from the envelope (artifact URLs and other literal references)
 - the deadline
@@ -252,7 +253,7 @@ This is a requirement on receivers and runbooks, not a feature of this repositor
 
 ### Continuation exception
 
-If callback information is missing from what a receiver can see, the default is to stop and request a complete resend or owner direction. Deriving the destination from an already-approved host plus the job id, and proceeding, is a run-only continuation exception. It requires the owner's explicit instruction for that run. It is not the default response to a malformed or incomplete job, and it is not implemented as automatic plugin or relay behavior.
+If callback information is missing from what a receiver can see, the default is to stop and seek owner direction or recovery of the existing delivery. Any resend is a separately authorized recovery decision, not a default and not a capability the relay currently supplies. Deriving the destination from an already-approved host plus the job id, and proceeding, is a run-only continuation exception. It requires the owner's explicit instruction for that run. It is not the default response to a malformed or incomplete job, and it is not implemented as automatic plugin or relay behavior.
 
 ## Sources (read November 7, 2026)
 

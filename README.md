@@ -47,37 +47,45 @@ You need [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-start
 
 ### 1. Install and enable
 
-Hermes loads plugins from the active profile's `plugins` folder, `$HERMES_HOME/plugins`. On a default local install that is `~/.hermes/plugins`. Hosted or custom setups may point `HERMES_HOME` elsewhere (for example `/opt/data`), so check with `hermes config path` (the config file sits in `HERMES_HOME`).
+Hermes loads plugins from the active profile's `plugins` folder, next to that profile's `config.yaml`. On a default local install that is `~/.hermes/plugins`. Hosted or custom setups, and named profiles, use a different home, so ask Hermes for the path. The config file sits in that profile's Hermes home.
 
-The install path exercised for this revision is a **profile-scoped, pinned native install** from the public git repository into the active Hermes profile. It is not a catalog install. A catalog entry is a separate, later change and is not required for this method. This document does not imply that a catalog entry has been admitted.
+Use one named profile for install, enable, configuration, and verification. `--profile` (also `-p`) is Hermes's process-wide profile selector and must appear before the subcommand. A child `hermes --profile ...` process sets `HERMES_HOME` for itself only and does not export it into your shell, so do not fall back to `${HERMES_HOME:-$HOME/.hermes}` after a named-profile install — that would inspect the default profile.
 
-Pin a full 40-character commit SHA of the revision you intend to run. Tags, branches, and abbreviated SHAs are not accepted. Hermes checks out that commit detached, verifies that `HEAD` matches the requested SHA, and records the source, revision, and pin in the current profile (`hermes plugins list` shows it as `git pinned@<sha>`). The same pin is available in Hermes Desktop under Skills → Plugins → Install from Git, in the Pin to commit field.
+The install path exercised for this revision is a **profile-scoped, pinned native install** from the public git repository. It is not a catalog install. A catalog entry is a separate, later change and is not required for this method. This document does not imply that a catalog entry has been admitted.
+
+Pin a full 40-character hexadecimal identifier of the revision you intend to run. Branch names, tag names, and abbreviated SHAs are not accepted. Hermes checks out that object detached, resolves it to a commit (an annotated-tag object SHA can be peeled to its commit), verifies that the checked-out `HEAD` matches that resolved commit, and records the source, revision, and pin in the current profile (`hermes plugins list` shows it as `git pinned@<sha>`).
+
+The same pin is documented in Hermes Desktop under Skills → Plugins → Install from Git, as **Pin to commit (optional)** under Advanced. This README does not treat that Desktop path as the one exercised here.
+
+Replace `PROFILE` with the profile that should own this install, and use that same name on every command below:
 
 ```bash
-hermes plugins install nerdcakes/hermes-dome-relay --ref <full-40-character-sha>
-hermes plugins enable dome-relay
+hermes --profile PROFILE plugins install nerdcakes/hermes-dome-relay --ref <full-40-hex-id> --no-enable
+hermes --profile PROFILE plugins enable dome-relay
 ```
 
-`hermes plugins update` will not move a pinned install. To change revision, install again with `--force --ref` and a new full SHA.
+`--no-enable` installs the plugin disabled, so enable is a separate, explicit step.
 
-**Manual install.** You can also clone this repository and symlink it into the profile's `plugins` folder. Clone somewhere permanent (not a temp folder; the plugin is a symlink to the clone), then run these from inside the clone, because `$(pwd)` is the link target:
+A named `hermes plugins update <name>` of this custom `--ref` git install is refused with an error. Catalog-managed installs have a separate repin path; that path is not what this section describes. To move this custom pin, reinstall with `--force --ref` and a new full 40-hex identifier. `--force` also accepts a security scanner's caution verdict without separate confirmation (dangerous verdicts still block), so it is not only overwrite permission. Do not run it casually.
+
+**Manual install.** You can also clone this repository and symlink it into that same profile's `plugins` folder. Clone somewhere permanent (not a temp folder; the plugin is a symlink to the clone), then run these from inside the clone, because `$(pwd)` is the link target:
 
 ```bash
 git clone https://github.com/nerdcakes/hermes-dome-relay
 cd hermes-dome-relay
-PLUGIN_DIR="${HERMES_HOME:-$HOME/.hermes}/plugins"
+PLUGIN_DIR="$(dirname "$(hermes --profile PROFILE config path)")/plugins"
 mkdir -p "$PLUGIN_DIR" && ln -s "$(pwd)" "$PLUGIN_DIR/dome-relay"
-hermes plugins enable dome-relay
+hermes --profile PROFILE plugins enable dome-relay
 ```
 
-That block is Bash. In fish, from the clone: `set -l plugin_dir "$HERMES_HOME/plugins"; mkdir -p $plugin_dir; ln -s (pwd) $plugin_dir/dome-relay`. In PowerShell: `New-Item -ItemType SymbolicLink -Path "$env:HERMES_HOME\plugins\dome-relay" -Target (Get-Location)`. If `HERMES_HOME` is unset, use the default profile directory `~/.hermes` (`$HOME/.hermes` in fish). This is only another way to write the symlink. It does not add Windows support.
+That block is Bash. In fish or PowerShell, use the same `PLUGIN_DIR` already resolved from `hermes --profile PROFILE config path`, then write the symlink in that shell's syntax (fish: `ln -s (pwd) $plugin_dir/dome-relay`; PowerShell: `New-Item -ItemType SymbolicLink -Path "$pluginDir\dome-relay" -Target (Get-Location)`). This is only another way to write the symlink. It does not add Windows support.
 
-Hermes reads `plugin.yaml` and the `__init__.py` beside it. For either install method, the plugin directory is the profile plugins folder. Check the wiring:
+Hermes reads `plugin.yaml` and the `__init__.py` beside it. For either install method, resolve the plugin directory from that profile's config path, then check the wiring:
 
 ```bash
-PLUGIN_DIR="${HERMES_HOME:-$HOME/.hermes}/plugins"
-hermes plugins doctor "$PLUGIN_DIR/dome-relay" --ci
-hermes plugins validate "$PLUGIN_DIR/dome-relay"
+PLUGIN_DIR="$(dirname "$(hermes --profile PROFILE config path)")/plugins"
+hermes --profile PROFILE plugins doctor "$PLUGIN_DIR/dome-relay" --ci
+hermes --profile PROFILE plugins validate "$PLUGIN_DIR/dome-relay"
 ```
 
 `hermes plugins validate` requires that plugin-directory path. Without it, Hermes reports a missing argument and does not check the plugin.
@@ -87,9 +95,11 @@ hermes plugins validate "$PLUGIN_DIR/dome-relay"
 `relay_url` is the relay's public origin: `https`, no path, and no key in the URL. It must be the same origin the relay was given as its public origin, because every job's callback is `{relay_url}/jobs/{job_id}/complete`.
 
 ```bash
-hermes config set plugins.entries.dome-relay.settings.relay_url https://relay.example
-hermes config set plugins.entries.dome-relay.settings.sender celeste
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.relay_url https://relay.example
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.sender celeste
 ```
+
+Use the same `--profile PROFILE` for later settings and for `hermes --profile PROFILE dome-relay worker`.
 
 `sender` is a label in the task JSON. It is not a secret. Leave `hop` at `1` (only `0` or `1` is allowed).
 
@@ -104,7 +114,7 @@ In the Hermes Desktop app, open the dome-relay plugin settings and fill in **Rel
 Two terminals. No real job text that posts, pays, or reads keys.
 
 ```bash
-hermes dome-relay worker
+hermes --profile PROFILE dome-relay worker
 ```
 
 Leave that running. In a Hermes chat, ask the agent to escalate a harmless research question:
@@ -123,7 +133,7 @@ Watch these observations separately. They are not all distinct values of the plu
 
 1. **Queued locally** — the plugin has saved the job. No relay call has been made yet.
 2. **Registered** — the worker has registered the job (`POST /jobs`) and the relay has stored it.
-3. **Wake accepted** — the relay's `wake_status` is `accepted` (the webhook returned HTTP 200: a routine run started, not that the work finished). After a successful wake the relay job `state` stays `registered`. The plugin records this as `state=accepted` together with `wake_status=accepted`. **Wake acceptance alone does not prove a claim.**
+3. **Wake accepted** — the relay's `wake_status` is `accepted` (the webhook returned HTTP 200: a routine run started, not that the work finished). After a successful wake, the relay job `state` stays `registered` while the job is still unclaimed, unless it has already advanced or terminated (`finish_wake()` leaves a state that already moved forward, for example if the executive claims before the wake request finishes). The plugin records this as `state=accepted` together with `wake_status=accepted`. **Wake acceptance alone does not prove a claim.**
 4. **Executive claimed** — `POST /jobs/{job_id}/claim` succeeded. The relay then sets its job `state` to `accepted` and returns `"status": "claimed"`. The plugin status tool does not receive a separate claim event, so a plugin `state` of `accepted` is not evidence that the executive claimed the job.
 5. **Result stored** — the executive posted a result, and the relay has saved it (`done`, `failed`, or `held`).
 6. **Result retrieved** — the worker or a status call has pulled that result (`GET /results`) into this profile, and `dome_relay_status` can show it.
@@ -146,7 +156,7 @@ Status reads the job that belongs to this conversation. Hermes v0.23.0 passes th
 
 The plugin and the relay accept briefs of 1 to 16,000 characters and results of at most 32,000 characters. Those are service-validation limits, counted in characters (not serialized UTF-8 request bytes). They are not guaranteed end-to-end delivery limits, and they do not establish how much of an accepted brief a receiving model will actually see.
 
-At this revision: unattended completion has not been demonstrated; live worker-restart integrity has not been tested; the wake request body has not been captured end to end; and how much of an accepted brief a receiving model sees is not established.
+At this revision: earlier acknowledgement and short-text round trips completed without a human ferrying the result; what is not demonstrated is unattended completion of a dense, multi-step task end to end without owner intervention. Live worker-restart integrity has not been tested; the wake request body has not been captured end to end; and how much of an accepted brief a receiving model sees is not established.
 
 ### What you can turn on later
 
@@ -187,7 +197,7 @@ A catalog entry is a separate, later change. It is not part of this plugin.
 This is the always-on box between the plugin and the Grok Bot executive.
 
 1. The plugin registers a job (`POST /jobs`) with the relay key.
-2. The relay saves the job, then POSTs the task text to the Grok routine webhook. **HTTP 200 means a run started (`wake_status: accepted`). It does not mean the work is finished, and it does not mean the executive has claimed the job.** After a successful wake the relay job `state` stays `registered`.
+2. The relay saves the job, then POSTs the task text to the Grok routine webhook. **HTTP 200 means a run started (`wake_status: accepted`). It does not mean the work is finished, and it does not mean the executive has claimed the job.** After a successful wake, the relay job `state` stays `registered` while the job is still unclaimed, unless it has already advanced or terminated (`finish_wake()` leaves a state that already moved forward, for example if the executive claims before the wake request finishes).
 3. The executive claims the job once (`POST /jobs/{job_id}/claim`) with a different key. A successful claim is when the relay sets its job `state` to `accepted` and returns `"status": "claimed"`. A second claim, a canceled job, or an expired job is refused.
 4. The executive posts the result (`POST /jobs/{job_id}/complete`).
 5. The plugin reads results (`GET /results?since=...`). Reading does not delete them. The plugin keeps its own cursor.
