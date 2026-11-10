@@ -46,7 +46,7 @@ The manifest and loadable root `__init__.py` are adjacent. `register(ctx)` lives
 
 In root `register(ctx)`, register exactly `dome_relay_escalate`, `dome_relay_status`, `dome_relay_cancel` using `ctx.register_tool(name=..., toolset="dome_relay", schema=..., handler=...)`. Each schema has name, description and a JSON Schema parameters object. Handlers accept `(args: dict, **kwargs) -> str`, catch errors and return JSON strings, including errors. Do not shadow existing tools. `register()` must perform no network calls or launch workers; doctor imports it in isolation.
 
-- escalate: target, brief, priority, deadline, artifacts, optional caller-supplied job_id and execution_location cloud/local. Persist before any send; return job_id and state immediately. Derive sender and callback URL from trusted settings/context, never arbitrary model arguments.
+- escalate: target, brief, priority, deadline, artifacts, optional caller-supplied job_id and execution_location cloud/local. Persist before any send; return job_id and state immediately. If the caller omits `deadline`, the plugin sets it to 20 minutes from now. The plugin also rejects a deadline more than 30 minutes in the future. Derive sender and callback URL from trusted settings/context, never arbitrary model arguments.
 - status: job_id; query the originating profile/conversation's job and latest result, never another user's job. This is the minimum durable return-to-origin mechanism.
 - cancel: job_id; stop retries and future result injection. Cancellation after acceptance is local/best-effort; it cannot undo external work or reliably interrupt a running Grok Bot routine.
 
@@ -105,6 +105,18 @@ Endpoints:
 
 `callback_url` must equal `{DOME_RELAY_PUBLIC_ORIGIN}/jobs/{job_id}/complete` exactly.
 
+### D. Observation boundaries
+
+These are separate observations. Do not treat one as proof of another, and do not treat a receiver's local status word as a relay state.
+
+- **Registration.** The plugin worker calls `POST /jobs`. A 201 means the relay stored the job and attempted the wake. A 200 means the same job was already registered. This is not a claim and not a result.
+- **Wake acceptance.** The relay's webhook call returned HTTP 200, and `wake_status` is `accepted`. A routine run started. It is not a result, and it is not a claim. After a successful wake the relay job `state` stays `registered` until the executive claims it. The plugin records wake acceptance as plugin `state=accepted` together with `wake_status=accepted`. That plugin `state` value is not evidence of a claim.
+- **Routine-local status.** Whatever the receiving routine reports about its own run is local to that routine. It is not a relay state and must not be recorded as one.
+- **Executive claim.** `POST /jobs/{job_id}/claim` succeeds with the callback key. The relay then sets its job `state` to `accepted` and returns `"status": "claimed"`. Only a claimed job may store a result.
+- **Relay result state.** `POST /jobs/{job_id}/complete` stores a `done`, `held`, or `failed` result on the relay. That stored record is the relay's result state. It is not a host notification and it does not resume the originating task or the executive routine.
+- **Parent summary.** Any condensed handoff from a receiving routine to a parent or executor is a separate step. It is not the stored envelope and not the stored result.
+- **Native notification.** A host or messaging notification about a finished process is distinct from the stored relay result and from `dome_relay_status`. The supported way to read a result is status retrieval in the origin conversation, or a direct pull of stored results.
+
 ## 4. JSON contracts
 
 These are JSON Schema draft 2020-12 contracts. All timestamps are RFC3339 UTC on the wire; human UI displays HST. Validate timestamp parsing, HTTPS hosts and deadline ordering in code as well as schema.
@@ -153,9 +165,11 @@ Identity hash: lowercase hex SHA-256 of the canonical JSON of the envelope with 
 
 `held` means an interim blocked update, not success; completed_at then means update time. A later done/failed result may supersede held. Exact held duplicates are rejected, distinct held updates receive new relay cursors. Done/failed are terminal. Local cancellation/expiry are local queue states, not extra wire Result values. Reject conflicting terminal results; quarantine late callbacks without resurrecting jobs.
 
+The envelope `brief` limit (1 to 16,000) and the result `result` limit (at most 32,000) are service-validation limits. They are counted in characters (Python `len` on the Unicode string), not in serialized UTF-8 request bytes. They are the limits the plugin and the relay enforce on an accepted request. They are not guaranteed end-to-end delivery limits, and they do not establish how much of an accepted brief a receiving model will actually see.
+
 ## 5. Reliability and local hold
 
-States: queued -> registered -> dispatching -> accepted -> done/failed. Side states: held_local, retry_wait, uncertain, canceled, expired. Keep delivery_pending/delivered separate from execution state.
+States: queued -> registered -> dispatching -> accepted -> done/failed. Side states: held_local, retry_wait, uncertain, canceled, expired. Keep delivery_pending/delivered separate from execution state. On the relay, `accepted` is the post-claim state; a successful wake leaves the relay job `registered` with `wake_status=accepted`. The plugin records that wake as plugin `state=accepted`. See section 3D.
 
 - Insert job_id under a UNIQUE constraint before side effects. Repeating identical escalate returns the existing handle; ID reuse with changed content is an error.
 - The relay retries the Grok wake up to three total attempts. After a transient failure, wait 5 seconds, then 15 seconds, plus a random extra of up to 1 second. A `Retry-After` header replaces that base wait and is still not honored if the wait would pass the job deadline. Retry connect failures and HTTP 408, 429, 500, 502, 503, and 504 only. Never retry 401 or 403. Do not follow redirects. A read or write timeout is uncertain and is not retried. The plugin may retry its own registration and result pull against the relay with the same 3-attempt schedule, and must never turn that retry into a second wake.
@@ -163,7 +177,7 @@ States: queued -> registered -> dispatching -> accepted -> done/failed. Side sta
 - One outstanding accepted job per target. Reserve the slot transactionally on claim. Release it on a terminal result (`done` or `failed`), on cancel, or when the deadline expires. Held jobs retain the slot.
 - One external escalation hop. A registration may use `hop` 0 or 1 and must not include `parent_job_id`. A higher hop or any parent is rejected and is not woken. `POST /jobs/{job_id}/complete` cannot dispatch another job.
 - Local-only jobs require an explicit local readiness heartbeat/lease. Missing or stale heartbeat means held_local, not repeated wake-ups. If the entire rig is off, existing callbacks remain on the cloud relay; new local queue work resumes when the machine returns.
-- Expiry is 30 minutes from server receive time. A client `deadline` may only shorten that window: it must be after `created_at`, in the future on the relay clock, and no later than 30 minutes after receipt. Register, claim, and complete all enforce it. `completed_at` is stored as a label and cannot extend the life of the job. A completion that arrives after expiry is quarantined and does not resurrect the job.
+- Expiry is 30 minutes from server receive time. A client `deadline` may only shorten that window: it must be after `created_at`, in the future on the relay clock, and no later than 30 minutes after receipt. Register, claim, and complete all enforce it. If the plugin caller omits `deadline`, the plugin sets it to 20 minutes from now; that default is still subject to the 30-minute ceiling. For a transaction that may need more than 20 minutes, pass an explicit deadline, still within 30 minutes of relay receipt. `completed_at` is stored as a label and cannot extend the life of the job. A completion that arrives after expiry is quarantined and does not resurrect the job.
 - Reconcile interrupted leases after restart. Fetch non-destructively from the last committed cursor; transactionally dedupe result records. Recover an in-flight wake (`dispatching` when the process died) as `uncertain` rather than treating it as unsent, and do not send it again. A row still `registered` with `wake_status` `pending` has not been sent; the next identical registration may send it once.
 - A claim that outlives the executive is not reclaimed. It remains `accepted` until cancel or the 30 minute expiry. Do not start a second claim for that job automatically.
 - Append audit metadata for transitions, attempts, accepted/uncertain/rejected wake, claims, duplicate rejection, auth failure counts and delivery. Do not put brief or result bodies, credentials, or full webhook URLs in logs or in the audit table. After a wake attempt finishes, delete the stored task text from the relay database. Results stay in SQLite on the volume until an operator deletes that database file. There is no purge tool in this version.
@@ -217,6 +231,28 @@ Known open items, called out so they are not treated as decided:
 
 - Per-target callback keys. Today every target shares one `DOME_RELAY_CALLBACK_KEY`.
 - A purge tool. Nothing in the relay deletes stored results except deleting the SQLite file by hand.
+
+At this revision, the following are not demonstrated or not established: unattended completion; live worker-restart integrity of an in-flight job; end-to-end capture of the wake request body; how much of an accepted brief a receiving model sees.
+
+## 10. Receiving-side runbook requirements (not implemented in this repository)
+
+The two rules in this section apply to receivers and their runbooks. They are not implemented by the plugin or the relay, and updating this document does not change receiving-side behavior.
+
+### Execution handoff
+
+An execution handoff — from a receiving routine or parent to the process that will claim and work the job — must preserve:
+
+- task identity (`job_id` and target)
+- exact references from the envelope (artifact URLs and other literal references)
+- the deadline
+- provenance (what was received, and from where)
+- completeness flags (whether the received brief or envelope is complete, and character or byte length if known)
+
+This is a requirement on receivers and runbooks, not a feature of this repository.
+
+### Continuation exception
+
+If callback information is missing from what a receiver can see, the default is to stop and request a complete resend or owner direction. Deriving the destination from an already-approved host plus the job id, and proceeding, is a run-only continuation exception. It requires the owner's explicit instruction for that run. It is not the default response to a malformed or incomplete job, and it is not implemented as automatic plugin or relay behavior.
 
 ## Sources (read November 7, 2026)
 
