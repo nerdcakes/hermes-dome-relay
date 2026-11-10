@@ -47,25 +47,45 @@ You need [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-start
 
 ### 1. Install and enable
 
-Hermes loads plugins from the active profile's `plugins` folder, `$HERMES_HOME/plugins`. On a default local install that is `~/.hermes/plugins`. Hosted or custom setups may point `HERMES_HOME` elsewhere (for example `/opt/data`), so check with `hermes config path` (the config file sits in `HERMES_HOME`).
+Hermes loads plugins from the active profile's `plugins` folder, next to that profile's `config.yaml`. On a default local install that is `~/.hermes/plugins`. Hosted or custom setups, and named profiles, use a different home, so ask Hermes for the path. The config file sits in that profile's Hermes home.
 
-Clone this repo somewhere permanent (not a temp folder; the plugin is a symlink to the clone), then run these from inside the clone, because `$(pwd)` is the link target:
+Use one named profile for install, enable, configuration, and verification. `--profile` (also `-p`) is Hermes's process-wide profile selector. Hermes also accepts it after the subcommand; this guide places it before the subcommand in every example, and that is the placement we recommend. A child `hermes --profile ...` process sets `HERMES_HOME` for itself only and does not export it into your shell, so do not fall back to `${HERMES_HOME:-$HOME/.hermes}` after a named-profile install — that would inspect the default profile.
+
+The install path exercised for this revision is a **profile-scoped, pinned native install** from the public git repository. It is not a catalog install. A catalog entry is a separate, later change and is not required for this method. This document does not imply that a catalog entry has been admitted.
+
+Pin a full 40-character hexadecimal identifier of the revision you intend to run. Branch names, tag names, and abbreviated SHAs are not accepted. Hermes checks out that object detached, resolves it to a commit (an annotated-tag object SHA can be peeled to its commit), verifies that the checked-out `HEAD` matches that resolved commit, and records the source, revision, and pin in the current profile (`hermes plugins list` shows it as `git pinned@<sha>`).
+
+The same pin is documented in Hermes Desktop under Skills → Plugins → Install from Git, as **Pin to commit (optional)** under Advanced. This README does not treat that Desktop path as the one exercised here.
+
+Replace `PROFILE` with the profile that should own this install, and use that same name on every command below:
+
+```bash
+hermes --profile PROFILE plugins install nerdcakes/hermes-dome-relay --ref <full-40-hex-id> --no-enable
+hermes --profile PROFILE plugins enable dome-relay
+```
+
+`--no-enable` installs the plugin disabled, so enable is a separate, explicit step.
+
+A named `hermes plugins update <name>` of this custom `--ref` git install is refused with an error. Catalog-managed installs have a separate repin path; that path is not what this section describes. To move this custom pin, reinstall with `--force --ref` and a new full 40-hex identifier. `--force` also accepts a security scanner's caution verdict without separate confirmation (dangerous verdicts still block), so it is not only overwrite permission. Do not run it casually.
+
+**Manual install.** You can also clone this repository and symlink it into that same profile's `plugins` folder. Clone somewhere permanent (not a temp folder; the plugin is a symlink to the clone), then run these from inside the clone, because `$(pwd)` is the link target:
 
 ```bash
 git clone https://github.com/nerdcakes/hermes-dome-relay
 cd hermes-dome-relay
-PLUGIN_DIR="${HERMES_HOME:-$HOME/.hermes}/plugins"
+PLUGIN_DIR="$(dirname "$(hermes --profile PROFILE config path)")/plugins"
 mkdir -p "$PLUGIN_DIR" && ln -s "$(pwd)" "$PLUGIN_DIR/dome-relay"
-hermes plugins enable dome-relay
+hermes --profile PROFILE plugins enable dome-relay
 ```
 
-That block is Bash. In fish, from the clone: `set -l plugin_dir "$HERMES_HOME/plugins"; mkdir -p $plugin_dir; ln -s (pwd) $plugin_dir/dome-relay`. In PowerShell: `New-Item -ItemType SymbolicLink -Path "$env:HERMES_HOME\plugins\dome-relay" -Target (Get-Location)`. If `HERMES_HOME` is unset, use the default profile directory `~/.hermes` (`$HOME/.hermes` in fish). This is only another way to write the symlink. It does not add Windows support.
+That block is Bash. In fish or PowerShell, use the same `PLUGIN_DIR` already resolved from `hermes --profile PROFILE config path`, then write the symlink in that shell's syntax (fish: `ln -s (pwd) $plugin_dir/dome-relay`; PowerShell: `New-Item -ItemType SymbolicLink -Path "$pluginDir\dome-relay" -Target (Get-Location)`). This is only another way to write the symlink. It does not add Windows support.
 
-Hermes reads `plugin.yaml` and the `__init__.py` beside it. Check the wiring:
+Hermes reads `plugin.yaml` and the `__init__.py` beside it. For either install method, resolve the plugin directory from that profile's config path, then check the wiring:
 
 ```bash
-hermes plugins doctor "$PLUGIN_DIR/dome-relay" --ci
-hermes plugins validate "$PLUGIN_DIR/dome-relay"
+PLUGIN_DIR="$(dirname "$(hermes --profile PROFILE config path)")/plugins"
+hermes --profile PROFILE plugins doctor "$PLUGIN_DIR/dome-relay" --ci
+hermes --profile PROFILE plugins validate "$PLUGIN_DIR/dome-relay"
 ```
 
 `hermes plugins validate` requires that plugin-directory path. Without it, Hermes reports a missing argument and does not check the plugin.
@@ -75,9 +95,11 @@ hermes plugins validate "$PLUGIN_DIR/dome-relay"
 `relay_url` is the relay's public origin: `https`, no path, and no key in the URL. It must be the same origin the relay was given as its public origin, because every job's callback is `{relay_url}/jobs/{job_id}/complete`.
 
 ```bash
-hermes config set plugins.entries.dome-relay.settings.relay_url https://relay.example
-hermes config set plugins.entries.dome-relay.settings.sender celeste
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.relay_url https://relay.example
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.sender celeste
 ```
+
+Use the same `--profile PROFILE` for later settings and for `hermes --profile PROFILE dome-relay worker`.
 
 `sender` is a label in the task JSON. It is not a secret. Leave `hop` at `1` (only `0` or `1` is allowed).
 
@@ -92,7 +114,7 @@ In the Hermes Desktop app, open the dome-relay plugin settings and fill in **Rel
 Two terminals. No real job text that posts, pays, or reads keys.
 
 ```bash
-hermes dome-relay worker
+hermes --profile PROFILE dome-relay worker
 ```
 
 Leave that running. In a Hermes chat, ask the agent to escalate a harmless research question:
@@ -102,22 +124,39 @@ Leave that running. In a Hermes chat, ask the agent to escalate a harmless resea
 - brief: a short public question
 - priority: `normal`
 
-The tool returns a `job_id` and `state` right away (`queued`). The worker registers the job. The relay wakes the executive. Then ask for status:
+The tool returns a `job_id` and `state` right away (`queued` locally, or `held_local` if the job is tagged `local` and this machine's worker heartbeat is stale). The worker then registers the job with the relay. Then ask for status:
 
 - tool: `dome_relay_status`
 - `job_id`: the id from the first call
 
-You should see `queued`, then `accepted` (a run started, the work is not finished yet), then `done` with the result text. A finished relay handoff (`accepted`, or a callback stored on the relay) is not the implementation finishing: a long coding job can still be underway, and `done` is the result text, not a merge. Asking again with the same `job_id` and the same brief returns the same job (`deduped: true`) and does not start a second run. Omitting `deadline` on that repeat is still the same job; the plugin keeps the deadline it saved the first time.
+Watch these observations separately. They are not all distinct values of the plugin's `state` field, and the same word `accepted` does not mean the same thing on the plugin and on the relay:
+
+1. **Queued locally** — the plugin has saved the job. No relay call has been made yet.
+2. **Registered** — the worker has registered the job (`POST /jobs`) and the relay has stored it.
+3. **Wake accepted** — the relay's `wake_status` is `accepted` (the webhook returned HTTP 200: a routine run started, not that the work finished). After a successful wake, the relay job `state` stays `registered` while the job is still unclaimed, unless it has already advanced or terminated (`finish_wake()` leaves a state that already moved forward, for example if the executive claims before the wake request finishes). The plugin records this as `state=accepted` together with `wake_status=accepted`. **Wake acceptance alone does not prove a claim.**
+4. **Executive claimed** — `POST /jobs/{job_id}/claim` succeeded. The relay then sets its job `state` to `accepted` and returns `"status": "claimed"`. The plugin status tool does not receive a separate claim event, so a plugin `state` of `accepted` is not evidence that the executive claimed the job.
+5. **Result stored** — the executive posted a result, and the relay has saved it (`done`, `failed`, or `held`).
+6. **Result retrieved** — the worker or a status call has pulled that result (`GET /results`) into this profile, and `dome_relay_status` can show it.
+
+A finished relay handoff (wake accepted, or a callback stored on the relay) is not the implementation finishing: a long coding job can still be underway, and `done` is the result text, not a merge. Asking again with the same `job_id` and the same brief returns the same job (`deduped: true`) and does not start a second run. If you omit `deadline` when the job is first created, the plugin sets it to 20 minutes from now. For a transaction that may need more than 20 minutes, pass an explicit deadline. The relay still caps every job at 30 minutes from the moment it received it, and a job's own deadline can only shorten that window. Omitting `deadline` on a repeat escalate is still the same job; the plugin keeps the deadline it saved the first time.
 
 Stop the worker with Ctrl-C. A result that arrives while it is stopped stays on the relay. Start the worker again and status shows it. The profile database is outside the plugin folder, so a plugin update does not delete it.
 
-`execution_location: local` waits until this machine's worker heartbeat is fresh (60 seconds, unless you change `local_heartbeat_seconds`). The spec left that window open; 60 seconds is this plugin's choice. `hermes dome-relay ready` refreshes the heartbeat without a poll.
+Loading or enabling the plugin, and the plugin's `register()` function, only record the tools, hooks, and the `hermes dome-relay` command. They do not start a worker. The worker is process polling: it performs network I/O and does not consume model tokens. Asking the Hermes agent for status is a conversation turn and does involve model and tool activity. A saved result, and the job's `callback_url`, do not resume the originating Hermes task and do not resume the executive routine. Completing a job only stores the result. The supported way to read it is `dome_relay_status` in the conversation that sent the job.
+
+`execution_location: local` waits until this machine's worker heartbeat is fresh (60 seconds, unless you change `local_heartbeat_seconds`). The spec left that window open; 60 seconds is this plugin's choice. `hermes --profile PROFILE dome-relay ready` refreshes the heartbeat without a poll.
 
 The worker command exists only when this plugin loads in-process. That is the Hermes default (`plugins.isolation: in_process`) and the supported deployment. `plugins.isolation: host` skips `register_cli_command`, and that registration is the only worker entrypoint, so `hermes dome-relay` is not installed. Leave Hermes terminal and Docker sandbox settings as they are; this is about where the plugin process loads, not about command sandboxing.
 
 Status reads the job that belongs to this conversation. Hermes v0.23.0 passes the physical `session_id` and does not pass a conversation id that stays put when rotating compression (`compression.in_place: false`) replaces that id. The public stable `conversation_id` was added to Hermes after v0.23.0, so this plugin does not call Hermes session internals to walk the lineage. It records an edge only from the `post_compaction` hook, when Hermes reports a new session id and a different previous id. A later status, cancel, or repeat escalate from that replacement session can see the same job. A different session in the same profile cannot. In-place compression (the Hermes default) keeps the session id, so no edge is required. If the hook did not run, a call that only has the new session id is `not_found`.
 
 `expired` means this profile stopped waiting, and the job no longer reserves its target. A terminal relay result (`done` or `failed`) that was accepted before the deadline still replaces that state when it is retrieved late. A `held` result stays in the status body so it can be read, and after the deadline the job state is `expired` so the next job for that target can be sent. A canceled job still does not return a result.
+
+### Service-validation limits and current limitations
+
+The plugin and the relay accept briefs of 1 to 16,000 characters and results of at most 32,000 characters. Those are service-validation limits, counted in characters (not serialized UTF-8 request bytes). They are not guaranteed end-to-end delivery limits, and they do not establish how much of an accepted brief a receiving model will actually see.
+
+At this revision: earlier acknowledgement and short-text round trips completed without a human ferrying the result; what is not demonstrated is unattended completion of a dense, multi-step task end to end without owner intervention. Live worker-restart integrity has not been tested; the wake request body has not been captured end to end; and how much of an accepted brief a receiving model sees is not established.
 
 ### What you can turn on later
 
@@ -127,8 +166,8 @@ Status reads the job that belongs to this conversation. Hermes v0.23.0 passes th
 - `inject_message` (default false): the plugin may call `ctx.inject_message` only when Hermes already passed a gateway `session_key`. On a gateway that also needs `plugins.entries.dome-relay.allow_gateway_injection: true`, which is a host grant, not a plugin setting. If Hermes returns false, the plugin does not retry that note, and status still works. Leave this off.
 
 ```bash
-hermes config set plugins.entries.dome-relay.settings.inject_context false
-hermes config set plugins.entries.dome-relay.settings.inject_message false
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.inject_context false
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.inject_message false
 ```
 
 ## What a job is not allowed to do
@@ -145,7 +184,7 @@ A completed job is a result, not an approval. If the result is code — a branch
 - Result text is stored on the relay and copied into this profile's plugin database when the worker or a status call reads it.
 - The only plugin credential is `DOME_RELAY_KEY`, via Hermes secret scope. The Grok key and the executive callback key stay on the relay and the executive.
 - Local state is a SQLite file under the active Hermes profile (`plugin-data/dome-relay`). The relay keeps its own SQLite file on the Fly volume. This version has no purge tool. Delete those files yourself if you want the text gone. The relay already deletes task text after the wake attempt; results stay until the database file is deleted.
-- The worker is explicit: `hermes dome-relay worker`. It polls every 15 seconds while a job is open, and waits longer when idle or the relay cannot be reached. Registration retries are 3 attempts, 5s then 15s plus up to 1s of jitter, honoring `Retry-After`. 401 and 403 are not retried.
+- The worker is explicit: `hermes --profile PROFILE dome-relay worker`. It polls every 15 seconds while a job is open, and waits longer when idle or the relay cannot be reached. Registration retries are 3 attempts, 5s then 15s plus up to 1s of jitter, honoring `Retry-After`. 401 and 403 are not retried.
 - Third-party services: your relay host, and Grok Bot when the relay wakes a routine. An always-on Fly machine can cost money while idle. See [The relay](#the-relay).
 - No telemetry, no self-updater, no shell, and no reading of unrelated files.
 
@@ -158,12 +197,12 @@ A catalog entry is a separate, later change. It is not part of this plugin.
 This is the always-on box between the plugin and the Grok Bot executive.
 
 1. The plugin registers a job (`POST /jobs`) with the relay key.
-2. The relay saves the job, then POSTs the task text to the Grok routine webhook. **HTTP 200 means a run started. It does not mean the work is finished.**
-3. The executive claims the job once (`POST /jobs/{job_id}/claim`) with a different key. A second claim, a canceled job, or an expired job is refused.
+2. The relay saves the job, then POSTs the task text to the Grok routine webhook. **HTTP 200 means a run started (`wake_status: accepted`). It does not mean the work is finished, and it does not mean the executive has claimed the job.** After a successful wake, the relay job `state` stays `registered` while the job is still unclaimed, unless it has already advanced or terminated (`finish_wake()` leaves a state that already moved forward, for example if the executive claims before the wake request finishes).
+3. The executive claims the job once (`POST /jobs/{job_id}/claim`) with a different key. A successful claim is when the relay sets its job `state` to `accepted` and returns `"status": "claimed"`. A second claim, a canceled job, or an expired job is refused.
 4. The executive posts the result (`POST /jobs/{job_id}/complete`).
 5. The plugin reads results (`GET /results?since=...`). Reading does not delete them. The plugin keeps its own cursor.
 
-A job lives at most **30 minutes** from the moment the relay received it, and sooner if the job's own deadline is sooner. The relay's clock decides. The time in the result body cannot extend that.
+A job lives at most **30 minutes** from the moment the relay received it, and sooner if the job's own deadline is sooner. The relay's clock decides. The time in the result body cannot extend that. If the plugin caller omits `deadline`, the plugin sets it to 20 minutes from now; that default is still subject to the 30-minute ceiling.
 
 Other locked rules: one accepted job at a time per target; one hop (a result cannot start another job); wake retries are 3 tries, waiting 5s then 15s plus a little jitter, only for temporary failures. A `Retry-After` header replaces the wait. **401 and 403 are never retried.** A timeout after the request may have been sent is treated as uncertain and is not sent again.
 
