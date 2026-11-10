@@ -49,7 +49,7 @@ You need [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-start
 
 Hermes loads plugins from the active profile's `plugins` folder, next to that profile's `config.yaml`. On a default local install that is `~/.hermes/plugins`. Hosted or custom setups, and named profiles, use a different home, so ask Hermes for the path. The config file sits in that profile's Hermes home.
 
-Use one named profile for install, enable, configuration, and verification. `--profile` (also `-p`) is Hermes's process-wide profile selector and must appear before the subcommand. A child `hermes --profile ...` process sets `HERMES_HOME` for itself only and does not export it into your shell, so do not fall back to `${HERMES_HOME:-$HOME/.hermes}` after a named-profile install — that would inspect the default profile.
+Use one named profile for install, enable, configuration, and verification. `--profile` (also `-p`) is Hermes's process-wide profile selector. Hermes also accepts it after the subcommand; this guide places it before the subcommand in every example, and that is the placement we recommend. A child `hermes --profile ...` process sets `HERMES_HOME` for itself only and does not export it into your shell, so do not fall back to `${HERMES_HOME:-$HOME/.hermes}` after a named-profile install — that would inspect the default profile.
 
 The install path exercised for this revision is a **profile-scoped, pinned native install** from the public git repository. It is not a catalog install. A catalog entry is a separate, later change and is not required for this method. This document does not imply that a catalog entry has been admitted.
 
@@ -144,7 +144,7 @@ Stop the worker with Ctrl-C. A result that arrives while it is stopped stays on 
 
 Loading or enabling the plugin, and the plugin's `register()` function, only record the tools, hooks, and the `hermes dome-relay` command. They do not start a worker. The worker is process polling: it performs network I/O and does not consume model tokens. Asking the Hermes agent for status is a conversation turn and does involve model and tool activity. A saved result, and the job's `callback_url`, do not resume the originating Hermes task and do not resume the executive routine. Completing a job only stores the result. The supported way to read it is `dome_relay_status` in the conversation that sent the job.
 
-`execution_location: local` waits until this machine's worker heartbeat is fresh (60 seconds, unless you change `local_heartbeat_seconds`). The spec left that window open; 60 seconds is this plugin's choice. `hermes dome-relay ready` refreshes the heartbeat without a poll.
+`execution_location: local` waits until this machine's worker heartbeat is fresh (60 seconds, unless you change `local_heartbeat_seconds`). The spec left that window open; 60 seconds is this plugin's choice. `hermes --profile PROFILE dome-relay ready` refreshes the heartbeat without a poll.
 
 The worker command exists only when this plugin loads in-process. That is the Hermes default (`plugins.isolation: in_process`) and the supported deployment. `plugins.isolation: host` skips `register_cli_command`, and that registration is the only worker entrypoint, so `hermes dome-relay` is not installed. Leave Hermes terminal and Docker sandbox settings as they are; this is about where the plugin process loads, not about command sandboxing.
 
@@ -166,8 +166,8 @@ At this revision: earlier acknowledgement and short-text round trips completed w
 - `inject_message` (default false): the plugin may call `ctx.inject_message` only when Hermes already passed a gateway `session_key`. On a gateway that also needs `plugins.entries.dome-relay.allow_gateway_injection: true`, which is a host grant, not a plugin setting. If Hermes returns false, the plugin does not retry that note, and status still works. Leave this off.
 
 ```bash
-hermes config set plugins.entries.dome-relay.settings.inject_context false
-hermes config set plugins.entries.dome-relay.settings.inject_message false
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.inject_context false
+hermes --profile PROFILE config set plugins.entries.dome-relay.settings.inject_message false
 ```
 
 ## What a job is not allowed to do
@@ -184,7 +184,7 @@ A completed job is a result, not an approval. If the result is code — a branch
 - Result text is stored on the relay and copied into this profile's plugin database when the worker or a status call reads it.
 - The only plugin credential is `DOME_RELAY_KEY`, via Hermes secret scope. The Grok key and the executive callback key stay on the relay and the executive.
 - Local state is a SQLite file under the active Hermes profile (`plugin-data/dome-relay`). The relay keeps its own SQLite file on the Fly volume. This version has no purge tool. Delete those files yourself if you want the text gone. The relay already deletes task text after the wake attempt; results stay until the database file is deleted.
-- The worker is explicit: `hermes dome-relay worker`. It polls every 15 seconds while a job is open, and waits longer when idle or the relay cannot be reached. Registration retries are 3 attempts, 5s then 15s plus up to 1s of jitter, honoring `Retry-After`. 401 and 403 are not retried.
+- The worker is explicit: `hermes --profile PROFILE dome-relay worker`. It polls every 15 seconds while a job is open, and waits longer when idle or the relay cannot be reached. Registration retries are 3 attempts, 5s then 15s plus up to 1s of jitter, honoring `Retry-After`. 401 and 403 are not retried.
 - Third-party services: your relay host, and Grok Bot when the relay wakes a routine. An always-on Fly machine can cost money while idle. See [The relay](#the-relay).
 - No telemetry, no self-updater, no shell, and no reading of unrelated files.
 
